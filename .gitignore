@@ -7,7 +7,6 @@ datasets/*.txt
 datasets/snapshot_cache/
 datasets/sample_cache/
 datasets/community_eval/
-tsg_feature_cache/
 
 # Python bytecode and tooling
 __pycache__/
