@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""
-Unified Dataset Construction for Coreness Prediction
-=====================================================
-Provides consistent data loading, snapshot building, feature extraction,
-and train/test splitting so that ALL prediction methods use the same data.
+"""Build k-core snapshots from generated temporal edge slices.
 
-Usage (as a library):
-    from datasets.dataset_builder import build_dataset
-    data = build_dataset("datasets/email-Eu-core-temporal.csv")
-    X_train, y_train = data["stage1"]["X_train"], data["stage1"]["y_train"]
-    X_test,  y_test  = data["stage1"]["X_test"],  data["stage1"]["y_test"]
+Pipeline:
+    data/<dataset>/<dataset>.csv
+        -> datasets.build_time_slices
+        -> data/<dataset>/time_slices/step_<step>_window_<window>/
+        -> build_snapshots
 """
 
 import csv
+import json
 import pickle
 from collections import defaultdict
 from pathlib import Path
 
 import networkit as nk
 
-SNAPSHOT_CACHE_DIR = Path(__file__).parent / "snapshot_cache"
 
-# ── Time constants ─────────────────────────────────────────────────────────
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
 DAY = 86400
 THREE_DAY = 3 * DAY
@@ -29,26 +25,21 @@ WEEK = 7 * DAY
 MONTH = 30 * DAY
 YEAR = 1
 
-# ── Default split parameters ───────────────────────────────────────────────
-
 DEFAULT_TEST_RATIO = 0.3
-DEFAULT_WINDOW = WEEK
-
-# ── k values ───────────────────────────────────────────────────────────────
-
 TARGET_KS = [1, 2, 3, 4, 5, 6]
 
 DATASET_VALID_KS = {
     "email-Eu-core-temporal": [3, 4, 5, 6, 7],
     "sx-mathoverflow": [3, 4, 5, 6, 7, 8, 9, 10],
     "sx-askubuntu": [3, 4, 5, 6, 7, 8],
-    "mooc": [3, 4, 5, 6, 7, 8, 9, 10],
+    "mooc": [3, 4, 5, 6, 7],
     "DBLP1": [3, 4, 5, 6, 7, 8, 9, 10],
-    "wiki-talk-temporal": [3, 4, 5, 6, 7, 8, 9, 10],
+    "wiki-talk-temporal": [3, 4, 5, 6, 7],
     "sx-superuser": [3, 4, 5, 6],
-
 }
 
+# Recommended default slice configuration for each dataset. These values are
+# only used to locate already-generated time slices; they never re-bin raw data.
 DATASET_WINDOW = {
     "email-Eu-core-temporal": WEEK,
     "sx-mathoverflow": 4 * WEEK,
@@ -57,190 +48,155 @@ DATASET_WINDOW = {
     "DBLP1": YEAR,
     "wiki-talk-temporal": MONTH,
     "sx-superuser": 4 * WEEK,
-
 }
 
-# ── Feature names ──────────────────────────────────────────────────────────
+
+def time_slices_dir(dataset_name, step_seconds, window_seconds):
+    """Return the canonical directory for one generated slice configuration."""
+    return (
+        DATA_ROOT
+        / dataset_name
+        / "time_slices"
+        / f"step_{step_seconds}_window_{window_seconds}"
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 1. Edge loading (from community_evolution.py)
-# ═══════════════════════════════════════════════════════════════════════════
+def load_time_slice_manifest(slices_dir):
+    """Load and validate the manifest produced by ``build_time_slices``."""
+    slices_dir = Path(slices_dir)
+    manifest_path = slices_dir / "metadata.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Time-slice metadata not found: {manifest_path}. "
+            "Run datasets.build_time_slices first."
+        )
+    with manifest_path.open() as manifest_file:
+        manifest = json.load(manifest_file)
 
-def load_edges(path):
-    edges = []
-    with open(path) as f:
-        first_line = f.readline().strip()
-        f.seek(0)
-        has_header = _has_header(first_line)
-        sep = _detect_separator(first_line, has_header)
-        if has_header:
-            reader = csv.DictReader(f)
-            ukey, vkey, tkey = _find_keys(reader.fieldnames)
-            for row in reader:
-                edges.append((int(row[ukey]), int(row[vkey]), int(row[tkey])))
-        else:
-            for line in f:
-                parts = line.strip().split(sep)
-                if len(parts) < 3:
-                    continue
-                edges.append((int(parts[0]), int(parts[1]), int(parts[2])))
-    edges.sort(key=lambda x: x[2])
-    return edges
+    required_keys = {"dataset", "step_seconds", "window_seconds", "slices"}
+    if not required_keys.issubset(manifest):
+        raise ValueError(f"Invalid time-slice metadata: {manifest_path}")
+    if not isinstance(manifest["slices"], list) or not manifest["slices"]:
+        raise ValueError(f"Time-slice metadata has no slices: {manifest_path}")
+    return manifest
 
 
-def _has_header(first_line):
-    parts = first_line.split()
-    if len(parts) >= 3:
+def _load_slice_edges(slice_path):
+    """Read one standardized slice CSV without reordering or re-binning it."""
+    with slice_path.open(newline="") as slice_file:
+        reader = csv.DictReader(slice_file)
+        required_columns = {"u", "v", "ts"}
+        if reader.fieldnames is None or not required_columns.issubset(reader.fieldnames):
+            raise ValueError(f"{slice_path} must have a u,v,ts header")
         try:
-            int(parts[0]); int(parts[1]); int(parts[2])
-            return False
-        except ValueError:
-            return True
-    return "," in first_line and any(c.isalpha() for c in first_line)
+            return [(int(row["u"]), int(row["v"])) for row in reader]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid edge in {slice_path}") from error
 
 
-def _detect_separator(first_line, has_header):
-    line = first_line
-    if has_header and "," in line:
-        return ","
-    if "\t" in line:
-        return "\t"
-    return None
+def _build_snapshot(slice_edges):
+    unique_nodes = sorted({node for edge in slice_edges for node in edge})
+    node_to_id = {node: index for index, node in enumerate(unique_nodes)}
+    id_to_node = {index: node for node, index in node_to_id.items()}
+
+    filtered_edges = []
+    seen = set()
+    for u, v in slice_edges:
+        if u == v:
+            continue
+        ui, vi = node_to_id[u], node_to_id[v]
+        edge_key = (min(ui, vi), max(ui, vi))
+        if edge_key not in seen:
+            seen.add(edge_key)
+            filtered_edges.append((u, v, ui, vi))
+
+    graph = nk.Graph(len(unique_nodes))
+    for _, _, ui, vi in filtered_edges:
+        graph.addEdge(ui, vi)
+
+    core_values = nk.centrality.CoreDecomposition(graph).run().scores()
+    core_dict = {id_to_node[index]: int(core) for index, core in enumerate(core_values)}
+    max_core = int(max(core_values)) if core_values else 0
+
+    nodes_by_core = defaultdict(set)
+    for node, core in core_dict.items():
+        nodes_by_core[core].add(node)
+
+    k_core_comps = {}
+    for k in range(1, max_core + 1):
+        cumulative_ids = set()
+        for core in range(k, max_core + 1):
+            cumulative_ids.update(node_to_id[node] for node in nodes_by_core.get(core, set()))
+
+        cumulative_list = sorted(cumulative_ids)
+        local_id = {node_id: index for index, node_id in enumerate(cumulative_list)}
+        subgraph = nk.Graph(len(cumulative_list))
+        for _, _, ui, vi in filtered_edges:
+            if ui in cumulative_ids and vi in cumulative_ids:
+                subgraph.addEdge(local_id[ui], local_id[vi])
+
+        components = []
+        for component in nk.components.ConnectedComponents(subgraph).run().getComponents():
+            original_nodes = frozenset(id_to_node[cumulative_list[node_id]] for node_id in component)
+            if original_nodes:
+                components.append(original_nodes)
+
+        k_core_comps[k] = {
+            "node_set": {id_to_node[node_id] for node_id in cumulative_ids},
+            "components": components,
+        }
+
+    return {
+        "edge_list": [(u, v, min(core_dict[u], core_dict[v])) for u, v, _, _ in filtered_edges],
+        "core_dict": core_dict,
+        "max_core": max_core,
+        "k_core_comps": k_core_comps,
+    }
 
 
-def _find_keys(fieldnames):
-    u = v = t = None
-    for fn in fieldnames:
-        fl = fn.lower().strip()
-        if fl in ("u", "user", "user_id", "src", "source", "from"):
-            u = fn
-        elif fl in ("v", "item", "item_id", "dst", "dest", "target", "to"):
-            v = fn
-        elif fl in ("ts", "timestamp", "time", "t"):
-            t = fn
-    return u or fieldnames[0], v or fieldnames[1], t or fieldnames[2]
+def build_snapshots(slices_dir):
+    """Build one k-core snapshot per generated time-slice CSV.
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. Snapshot building (from community_evolution.py)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _snapshot_cache_key(edge_path, window_sec):
-    from pathlib import Path
-    name = Path(edge_path).stem
-    return f"snapshots_{name}_{window_sec}.pkl"
-
-
-def build_snapshots(edge_path, window_sec, edges=None):
-    cache_key = _snapshot_cache_key(edge_path, window_sec)
-    cache_path = SNAPSHOT_CACHE_DIR / cache_key
+    The input is a ``time_slices/step_<step>_window_<window>`` directory, not
+    the raw dataset CSV. The resulting cache is scoped to that exact slice
+    configuration so different window choices cannot share stale state.
+    """
+    slices_dir = Path(slices_dir)
+    manifest = load_time_slice_manifest(slices_dir)
+    cache_dir = slices_dir / "snapshot_cache"
+    cache_path = cache_dir / "snapshots.pkl"
 
     if cache_path.exists():
-        print(f"[dataset_builder] Loading cached snapshots from {cache_path.name}")
-        with open(cache_path, "rb") as f:
-            cached = pickle.load(f)
+        print(f"[dataset_builder] Loading cached snapshots from {cache_path}")
+        with cache_path.open("rb") as cache_file:
+            cached = pickle.load(cache_file)
         return cached["snapshots"], cached["total_nodes"]
 
-    if edges is None:
-        edges = load_edges(edge_path)
-    if not edges:
-        return [], 0
-
-    total_nodes = len(set(u for e in edges for u in (e[0], e[1])))
-
-    ts_min = edges[0][2]
-    ts_max = edges[-1][2]
-    n_windows = int((ts_max - ts_min) // window_sec) + 1
-
-    edge_bins = [[] for _ in range(n_windows)]
-    for u, v, t in edges:
-        bi = int((t - ts_min) // window_sec)
-        edge_bins[bi].append((u, v))
-
     snapshots = []
-    for idx_seq, i in enumerate(range(n_windows)):
-        snap_edges = edge_bins[i]
+    total_node_ids = set()
+    for position, slice_info in enumerate(manifest["slices"]):
+        slice_filename = slice_info.get("file")
+        if not slice_filename:
+            raise ValueError(f"Slice {position} has no file in {slices_dir / 'metadata.json'}")
+        slice_path = slices_dir / slice_filename
+        if not slice_path.is_file():
+            raise FileNotFoundError(f"Time-slice file not found: {slice_path}")
 
-        if not snap_edges:
-            continue
+        slice_edges = _load_slice_edges(slice_path)
+        snapshot = _build_snapshot(slice_edges)
+        snapshot["slice_index"] = slice_info.get("index", position)
+        snapshot["start_ts"] = slice_info.get("start_ts")
+        snapshot["end_ts"] = slice_info.get("end_ts")
+        snapshots.append(snapshot)
+        total_node_ids.update(node for edge in slice_edges for node in edge)
 
-        unique_nodes = sorted(set(u for e in snap_edges for u in e))
-        node_to_id = {v: idx for idx, v in enumerate(unique_nodes)}
-        id_to_node = {idx: v for v, idx in node_to_id.items()}
-        n_nodes = len(unique_nodes)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("wb") as cache_file:
+        pickle.dump(
+            {"snapshots": snapshots, "total_nodes": len(total_node_ids)},
+            cache_file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    print(f"[dataset_builder] Cached snapshots to {cache_path}")
 
-        filtered_edges = []
-        seen = set()
-        for u, v in snap_edges:
-            if u == v:
-                continue
-            ui, vi = node_to_id[u], node_to_id[v]
-            key = (min(ui, vi), max(ui, vi))
-            if key not in seen:
-                seen.add(key)
-                filtered_edges.append((u, v, ui, vi))
-
-        g = nk.Graph(n_nodes)
-        for _, _, ui, vi in filtered_edges:
-            g.addEdge(ui, vi)
-
-        core_vals = nk.centrality.CoreDecomposition(g).run().scores()
-
-        core_dict = {id_to_node[i]: int(c) for i, c in enumerate(core_vals)}
-        max_core = int(max(core_vals))
-
-        nodes_by_core = defaultdict(set)
-        for node, c in core_dict.items():
-            nodes_by_core[c].add(node)
-
-        k_core_comps = {}
-        for k in range(1, max_core + 1):
-            cum_ids = set()
-            for kk in range(k, max_core + 1):
-                for nd in nodes_by_core.get(kk, set()):
-                    cum_ids.add(node_to_id[nd])
-
-            if not cum_ids:
-                k_core_comps[k] = {
-                    "node_set": set(),
-                    "components": [],
-                }
-                continue
-
-            cum_list = sorted(cum_ids)
-            cum_local = {nid: li for li, nid in enumerate(cum_list)}
-            sub_g = nk.Graph(len(cum_list))
-            for _, _, ui, vi in filtered_edges:
-                if ui in cum_ids and vi in cum_ids:
-                    sub_g.addEdge(cum_local[ui], cum_local[vi])
-
-            cc = nk.components.ConnectedComponents(sub_g).run()
-            nk_components = cc.getComponents()
-            components = []
-            for comp in nk_components:
-                orig = frozenset(id_to_node[cum_list[nid]] for nid in comp)
-                if orig:
-                    components.append(orig)
-
-            cum_nodes = {id_to_node[nid] for nid in cum_ids}
-            k_core_comps[k] = {
-                "node_set": cum_nodes,
-                "components": components,
-            }
-
-        edge_list = [(u, v, min(core_dict[u], core_dict[v])) for u, v, _, _ in filtered_edges]
-
-        snapshots.append({
-            "edge_list": edge_list,
-            "core_dict": core_dict,
-            "max_core": max_core,
-            "k_core_comps": k_core_comps,
-        })
-
-    SNAPSHOT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump({"snapshots": snapshots, "total_nodes": total_nodes}, f)
-    print(f"[dataset_builder] Cached snapshots to {cache_path.name}")
-
-    return snapshots, total_nodes
+    return snapshots, len(total_node_ids)

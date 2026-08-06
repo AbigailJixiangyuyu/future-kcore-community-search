@@ -1,12 +1,11 @@
-# Raw temporal-network data
-datasets/*.csv
-datasets/*.tsv
-datasets/*.txt
-
-# Generated dataset and feature caches
-datasets/snapshot_cache/
-datasets/sample_cache/
-datasets/community_eval/
+# Dataset-specific raw data and generated artifacts
+data/*/*.csv
+data/*/*.tsv
+data/*/*.txt
+data/*/snapshot_cache/
+data/*/sample_cache/
+data/*/community_eval/
+data/*/time_slices/
 
 # Python bytecode and tooling
 __pycache__/

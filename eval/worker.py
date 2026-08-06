@@ -22,13 +22,21 @@ def eval_batch_streaming_tcs(args):
     for s in samples:
         t, q, k = s["t"], s["query"], s["k"]
         t0 = time.time()
-        pred, q_rejected = tcs.predict(t, q, k)
+        prediction, q_rejected = tcs.predict(t, q, k)
         _worker_tcs_predict_time += time.time() - t0
         _worker_tcs_predict_calls += 1
-        m = set_metrics(pred, s["community"])
-        sr = len(pred) / len(s["community"]) if len(s["community"]) > 0 else 0.0
-        pr = len(pred) / total_nodes * 100
-        rows.append((k, m["f1"], m["precision"], m["recall"], sr, pr, q_rejected))
+        metrics = set_metrics(prediction, s["community"])
+        size_ratio = len(prediction) / len(s["community"])
+        prediction_ratio = len(prediction) / total_nodes * 100
+        rows.append((
+            k,
+            metrics["f1"],
+            metrics["precision"],
+            metrics["recall"],
+            size_ratio,
+            prediction_ratio,
+            q_rejected,
+        ))
     return rows, _worker_tcs_predict_time, _worker_tcs_predict_calls
 
 
@@ -39,11 +47,18 @@ def eval_batch_streaming_hcu(args):
     rows = []
     for s in samples:
         t0 = time.time()
-        pred = predict_hcu(s, snaps)
+        prediction = predict_hcu(s, snaps)
         _worker_hcu_predict_time += time.time() - t0
         _worker_hcu_predict_calls += 1
-        m = set_metrics(pred, s["community"])
-        sr = len(pred) / len(s["community"]) if len(s["community"]) > 0 else 0.0
-        pr = len(pred) / total_nodes * 100
-        rows.append((s["k"], m["f1"], m["precision"], m["recall"], sr, pr))
+        metrics = set_metrics(prediction, s["community"])
+        size_ratio = len(prediction) / len(s["community"])
+        prediction_ratio = len(prediction) / total_nodes * 100
+        rows.append((
+            s["k"],
+            metrics["f1"],
+            metrics["precision"],
+            metrics["recall"],
+            size_ratio,
+            prediction_ratio,
+        ))
     return rows, _worker_hcu_predict_time, _worker_hcu_predict_calls

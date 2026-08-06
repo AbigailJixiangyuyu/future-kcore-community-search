@@ -10,6 +10,7 @@ def predict(s, snaps):
     t0 = _time.time()
     t, q, k = s["t"], s["query"], s["k"]
     predicted = set()
+    # t is the latest observed snapshot; predict the community at t + 1.
     for past_t in range(t + 1):
         k_info = snaps[past_t].get("k_core_comps", {}).get(k)
         if k_info is None:

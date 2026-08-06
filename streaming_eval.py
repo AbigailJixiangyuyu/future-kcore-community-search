@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streaming evaluation: 70/30 split, predict -> evaluate -> ingest loop."""
+"""Streaming next-snapshot k-core community evaluation."""
 import os
 import sys
 import time
@@ -11,7 +11,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from datasets.dataset_builder import DATASET_VALID_KS, DATASET_WINDOW, build_snapshots
+from datasets.dataset_builder import (
+    DATASET_VALID_KS,
+    DATASET_WINDOW,
+    build_snapshots,
+    time_slices_dir,
+)
 from datasets.community_eval_builder import (
     sample_qk_coreness_weighted,
     set_metrics,
@@ -25,13 +30,16 @@ def _print_table(header, valid_ks, per_k):
     print(f"  {header}")
     print(f"  {'k':>3} | {'F1':>7} | {'Prec':>7} | {'Recall':>7} | {'SizeR':>7} | {'PredR':>7}")
     print(f"  {'---':>3} | {'---':>7} | {'---':>7} | {'---':>7} | {'---':>7} | {'---':>7}")
-    nan_row = {"f1": float("nan"), "precision": float("nan"), "recall": float("nan"),
-               "size_ratio": float("nan"), "pred_ratio": float("nan")}
-    mac = {"f1": [], "precision": [], "recall": [], "size_ratio": [], "pred_ratio": []}
+    nan_row = {"f1": float("nan"), "precision": float("nan"),
+               "recall": float("nan"), "size_ratio": float("nan"),
+               "pred_ratio": float("nan")}
+    mac = {"f1": [], "precision": [], "recall": [],
+           "size_ratio": [], "pred_ratio": []}
     for k in sorted(valid_ks):
         row = per_k.get(k, nan_row)
         print(f"  {k:>3} | {row['f1']:>7.4f} | {row['precision']:>7.4f} | "
-              f"{row['recall']:>7.4f} | {row['size_ratio']:>7.2f}x | {row['pred_ratio']:>6.2f}%")
+              f"{row['recall']:>7.4f} | {row['size_ratio']:>7.2f}x | "
+              f"{row['pred_ratio']:>6.2f}%")
         for m in mac:
             v = row.get(m, float("nan"))
             if not np.isnan(v):
@@ -89,29 +97,48 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--relax", type=float, default=4, help="relax factor for dynamic tau (None=fixed tau=0.15)")
+    parser.add_argument("--step-seconds", type=int, default=None,
+                        help="time-slice step; defaults to the dataset's configured window")
+    parser.add_argument("--window-seconds", type=int, default=None,
+                        help="time-slice window; defaults to the dataset's configured window")
+    parser.add_argument("--dataset", choices=sorted(DATASET_VALID_KS), default=None,
+                        help="run one dataset instead of the default dataset list")
     args = parser.parse_args()
 
-    datasets = [
-        "datasets/email-Eu-core-temporal.csv",
-        "datasets/mooc.csv",
-        # "datasets/sx-mathoverflow.csv",
-        # "datasets/DBLP1.csv",
-        "datasets/wiki-talk-temporal.txt",
-        # "datasets/sx-superuser.txt",
+    default_dataset_names = [
+        "email-Eu-core-temporal",
+        "mooc",
+        # "sx-mathoverflow",
+        # "DBLP1",
+        "wiki-talk-temporal",
+        # "sx-superuser",
     ]
+    dataset_names = [args.dataset] if args.dataset else default_dataset_names
 
-    for dp in datasets:
-        from pathlib import Path
-        dn = Path(dp).stem
+    for dn in dataset_names:
         valid_ks = DATASET_VALID_KS.get(dn, [3, 4, 5])
-        window = DATASET_WINDOW.get(dn, 86400)
+        default_window = DATASET_WINDOW.get(dn, 86400)
+        step_seconds = args.step_seconds or default_window
+        window_seconds = args.window_seconds or default_window
+        slices_dir = time_slices_dir(dn, step_seconds, window_seconds)
+        if not slices_dir.is_dir():
+            raise FileNotFoundError(
+                f"Time slices not found: {slices_dir}. Build them first with: "
+                f"python -m datasets.build_time_slices {dn} "
+                f"{step_seconds} {window_seconds}"
+            )
 
         print(f"\n{'='*60}")
-        print(f"[{dn}] Loading and building snapshots (window={window}s) ...")
+        print(f"[{dn}] Loading time slices (step={step_seconds}s, window={window_seconds}s) ...")
         t0 = time.time()
-        snaps, total_nodes = build_snapshots(dp, window)
+        snaps, total_nodes = build_snapshots(slices_dir)
         total_snaps = len(snaps)
         split = int(total_snaps * 0.7)
+        if split < 1 or split >= total_snaps - 1:
+            raise ValueError(
+                f"{dn} needs initialization history plus current and next "
+                "snapshots for community evaluation"
+            )
         print(f"  {total_snaps} snapshots, split={split} (70/30)")
         print(f"  Init: G_0..G_{split-1}, Stream: G_{split}..G_{total_snaps-1}")
         print(f"  Total nodes: {total_nodes}")
@@ -119,12 +146,25 @@ def main():
 
         t0 = time.time()
         init_snaps = snaps[:split]
-        tcs = StreamingTCS(init_snaps, valid_ks, alpha=0.7, tau=0.15, total_nodes=total_nodes, relax=args.relax)
+        tcs = StreamingTCS(
+            init_snaps,
+            valid_ks,
+            alpha=0.7,
+            tau=0.15,
+            total_nodes=total_nodes,
+            relax=args.relax,
+        )
         print(f"  StreamingTCS initialized in {time.time()-t0:.1f}s, current_t={tcs.current_t}")
 
-        samples = sample_qk_coreness_weighted(snaps, split, valid_ks, dataset_name=dn)
-        samples = [s for s in samples if len(s["community"]) > 0]
-        print(f"  {len(samples)} test samples (non-empty)")
+        samples = sample_qk_coreness_weighted(
+            snaps,
+            split,
+            valid_ks,
+            dataset_name=dn,
+            cache_dir=slices_dir / "sample_cache",
+        )
+        samples = [sample for sample in samples if sample["community"]]
+        print(f"  {len(samples)} community samples (non-empty ground truth)")
 
         samples_by_t = defaultdict(list)
         for s in samples:
@@ -144,15 +184,14 @@ def main():
         print(f"\n  Streaming evaluation ...")
         t_eval_start = time.time()
         max_eval_t = total_snaps - 2
-
         for t in sorted(samples_by_t.keys()):
             if t > max_eval_t:
                 continue
 
-            if t > tcs.current_t:
-                ti = time.time()
-                tcs.ingest(snaps[t])
-                phase_times["ingest"] += time.time() - ti
+            while t > tcs.current_t:
+                ingest_start = time.time()
+                tcs.ingest(snaps[tcs.current_t + 1])
+                phase_times["ingest"] += time.time() - ingest_start
 
             batch = samples_by_t[t]
 
@@ -178,8 +217,10 @@ def main():
                         rows, wt_tcs, wc_tcs = fut.result()
                         worker_tcs_time += wt_tcs
                         worker_tcs_calls += wc_tcs
-                        for k, f1, prec, rec, sr, pr, _ in rows:
-                            tcs_by_k[k].append((f1, prec, rec, sr, pr))
+                        for k, f1, precision, recall, size_ratio, pred_ratio, _ in rows:
+                            tcs_by_k[k].append(
+                                (f1, precision, recall, size_ratio, pred_ratio)
+                            )
                     phase_times["wait_tcs_workers"] += time.time() - t_wait_tcs
 
                     t_wait_hcu = time.time()
@@ -187,30 +228,36 @@ def main():
                         rows, wt_hcu, wc_hcu = fut.result()
                         worker_hcu_time += wt_hcu
                         worker_hcu_calls += wc_hcu
-                        for k, f1, prec, rec, sr, pr in rows:
-                            hcu_by_k[k].append((f1, prec, rec, sr, pr))
+                        for k, f1, precision, recall, size_ratio, pred_ratio in rows:
+                            hcu_by_k[k].append(
+                                (f1, precision, recall, size_ratio, pred_ratio)
+                            )
                     phase_times["wait_hcu_workers"] += time.time() - t_wait_hcu
                 phase_times["parallel_dispatch_total"] += time.time() - t_dispatch
             else:
                 t_single = time.time()
                 for s in batch:
                     t_pred = time.time()
-                    pred_tcs, _ = tcs.predict(t, s["query"], s["k"])
+                    predicted_tcs, _ = tcs.predict(t, s["query"], s["k"])
                     phase_times["single_tcs_predict"] += time.time() - t_pred
-
-                    m = set_metrics(pred_tcs, s["community"])
-                    sr = len(pred_tcs) / len(s["community"]) if len(s["community"]) > 0 else 0.0
-                    pr = len(pred_tcs) / total_nodes * 100
-                    tcs_by_k[s["k"]].append((m["f1"], m["precision"], m["recall"], sr, pr))
+                    metrics = set_metrics(predicted_tcs, s["community"])
+                    size_ratio = len(predicted_tcs) / len(s["community"])
+                    pred_ratio = len(predicted_tcs) / total_nodes * 100
+                    tcs_by_k[s["k"]].append((
+                        metrics["f1"], metrics["precision"], metrics["recall"],
+                        size_ratio, pred_ratio,
+                    ))
 
                     t_hcu = time.time()
-                    pred_hcu = hcu_predict(s, snaps)
+                    predicted_hcu = hcu_predict(s, snaps)
                     phase_times["single_hcu_predict"] += time.time() - t_hcu
-
-                    m_hcu = set_metrics(pred_hcu, s["community"])
-                    sr_hcu = len(pred_hcu) / len(s["community"]) if len(s["community"]) > 0 else 0.0
-                    pr_hcu = len(pred_hcu) / total_nodes * 100
-                    hcu_by_k[s["k"]].append((m_hcu["f1"], m_hcu["precision"], m_hcu["recall"], sr_hcu, pr_hcu))
+                    hcu_metrics = set_metrics(predicted_hcu, s["community"])
+                    hcu_size_ratio = len(predicted_hcu) / len(s["community"])
+                    hcu_pred_ratio = len(predicted_hcu) / total_nodes * 100
+                    hcu_by_k[s["k"]].append((
+                        hcu_metrics["f1"], hcu_metrics["precision"],
+                        hcu_metrics["recall"], hcu_size_ratio, hcu_pred_ratio,
+                    ))
                 phase_times["single_thread_total"] += time.time() - t_single
 
         elapsed = time.time() - t_eval_start
@@ -218,30 +265,30 @@ def main():
 
         tcs_per_k = {}
         for k, vals in tcs_by_k.items():
-            f1s, precs, recs, srs, prs = zip(*vals)
+            f1s, precisions, recalls, size_ratios, pred_ratios = zip(*vals)
             tcs_per_k[k] = {
                 "f1": float(np.mean(f1s)),
-                "precision": float(np.mean(precs)),
-                "recall": float(np.mean(recs)),
-                "size_ratio": float(np.nanmean(srs)),
-                "pred_ratio": float(np.nanmean(prs)),
+                "precision": float(np.mean(precisions)),
+                "recall": float(np.mean(recalls)),
+                "size_ratio": float(np.mean(size_ratios)),
+                "pred_ratio": float(np.mean(pred_ratios)),
             }
 
         hcu_per_k = {}
         for k, vals in hcu_by_k.items():
-            f1s, precs, recs, srs, prs = zip(*vals)
+            f1s, precisions, recalls, size_ratios, pred_ratios = zip(*vals)
             hcu_per_k[k] = {
                 "f1": float(np.mean(f1s)),
-                "precision": float(np.mean(precs)),
-                "recall": float(np.mean(recs)),
-                "size_ratio": float(np.nanmean(srs)),
-                "pred_ratio": float(np.nanmean(prs)),
+                "precision": float(np.mean(precisions)),
+                "recall": float(np.mean(recalls)),
+                "size_ratio": float(np.mean(size_ratios)),
+                "pred_ratio": float(np.mean(pred_ratios)),
             }
 
         tau_mode = f"dynamic relax={args.relax}" if args.relax else "fixed tau=0.15"
-        print(f"\n[{dn}] Results ({tau_mode}, 70/30 split, streaming)")
-        _print_table(f"TCS (streaming, {tau_mode})", valid_ks, tcs_per_k)
-        _print_table("HCU", valid_ks, hcu_per_k)
+        print(f"\n[{dn}] Community Results ({tau_mode}, 70/30 split, streaming)")
+        _print_table(f"TCS (community, {tau_mode})", valid_ks, tcs_per_k)
+        _print_table("HCU (community union)", valid_ks, hcu_per_k)
 
         hcu_prof = get_hcu_profile()
         # _print_profile_report(

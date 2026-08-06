@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
 Community Evaluation Dataset Builder
-=====================================
-Builds a fixed evaluation set of (q, k, t) samples with ground-truth
-k-core communities for comparing different community prediction methods.
+====================================
+Builds fixed (q, k, t) samples with ground-truth k-core communities in the
+next snapshot. Predictors may use snapshots through t and predict the connected
+k-core component containing q in snapshot t + 1.
 
-Sampling strategy: coreness-weighted — nodes closer to the dense core
-are sampled more often, since predicting their communities is more
-practically meaningful.
+Sampling strategy: coreness-weighted. Nodes that remain in the k-core are
+sampled most heavily, with a smaller number of nodes that leave the k-core.
 
     weight(q, k, t) = coreness(q, t) - k + 1
 
 Usage (CLI):
-    python -m datasets.community_eval_builder <edge_list> [--max-per-kt 20]
+    python -m datasets.community_eval_builder <time_slices_dir> [--max-per-kt 20]
 
 Usage (library):
     from datasets.community_eval_builder import build_community_eval_dataset
-    data = build_community_eval_dataset("datasets/email-Eu-core-temporal.csv")
+    data = build_community_eval_dataset(
+        "data/email-Eu-core-temporal/time_slices/step_604800_window_604800"
+    )
     for s in data["samples"]:
         print(s["query"], s["k"], s["t"], len(s["community"]))
 """
@@ -29,33 +31,24 @@ from pathlib import Path
 import numpy as np
 
 from datasets.dataset_builder import (
-    DAY,
-    THREE_DAY,
-    WEEK,
-    MONTH,
     TARGET_KS,
     DATASET_VALID_KS,
-    DATASET_WINDOW,
     DEFAULT_TEST_RATIO,
-    load_edges,
     build_snapshots,
+    load_time_slice_manifest,
 )
 
 DEFAULT_MAX_PER_KT = 20
 DEFAULT_SEED = 42
-SAVE_DIR = os.path.join(os.path.dirname(__file__), "community_eval")
-SAMPLE_CACHE_DIR = Path(__file__).parent / "sample_cache"
 
 
 def _get_community(snaps, t, q, k):
     k_info = snaps[t]["k_core_comps"].get(k)
-    if k_info is None:
+    if k_info is None or q not in k_info["node_set"]:
         return frozenset()
-    if q not in k_info["node_set"]:
-        return frozenset()
-    for comp in k_info["components"]:
-        if q in comp:
-            return frozenset(comp)
+    for component in k_info["components"]:
+        if q in component:
+            return frozenset(component)
     return frozenset()
 
 
@@ -71,20 +64,29 @@ def _weighted_sample(rng, candidates, cur_cd, k, n):
     return [candidates[i] for i in chosen_idx]
 
 
-def _sample_cache_key(dataset_name, split_ti, valid_ks, max_per_kt, empty_per_kt, seed):
+def _sample_cache_key(dataset_name, split_ti, valid_ks, max_per_kt,
+                      empty_per_kt, seed):
     ks_str = "_".join(str(k) for k in sorted(valid_ks))
-    return f"samples_{dataset_name}_split{split_ti}_k{ks_str}_n{max_per_kt}_e{empty_per_kt}_s{seed}.pkl"
+    return (
+        f"community_samples_v1_{dataset_name}_split{split_ti}_k{ks_str}_"
+        f"n{max_per_kt}_e{empty_per_kt}_s{seed}.pkl"
+    )
 
 
 def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
                                 max_per_kt=DEFAULT_MAX_PER_KT,
                                 empty_per_kt=5,
                                 seed=DEFAULT_SEED,
-                                dataset_name=None):
-    if dataset_name is not None:
+                                dataset_name=None,
+                                cache_dir=None):
+    if not 0 <= split_ti < len(snaps) - 1:
+        raise ValueError("Community evaluation requires a current and next snapshot")
+    cache_path = None
+    if dataset_name is not None and cache_dir is not None:
         cache_key = _sample_cache_key(dataset_name, split_ti, valid_ks,
                                       max_per_kt, empty_per_kt, seed)
-        cache_path = SAMPLE_CACHE_DIR / cache_key
+        cache_dir = Path(cache_dir)
+        cache_path = cache_dir / cache_key
         if cache_path.exists():
             print(f"[community_eval] Loading cached samples from {cache_path.name}")
             with open(cache_path, "rb") as f:
@@ -94,34 +96,38 @@ def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
     samples = []
 
     for t in range(split_ti, len(snaps) - 1):
-        cur_cd = snaps[t]["core_dict"]
-        nxt_cd = snaps[t + 1]["core_dict"]
+        current_cd = snaps[t]["core_dict"]
+        next_cd = snaps[t + 1]["core_dict"]
 
         for k in valid_ks:
-            cur_k_info = snaps[t]["k_core_comps"].get(k)
-            if cur_k_info is None:
-                # print("no k info in ", k)
+            current_k_info = snaps[t]["k_core_comps"].get(k)
+            if current_k_info is None:
                 continue
-            cur_k_nodes = list(cur_k_info["node_set"])
-            if not cur_k_nodes:
+            current_k_nodes = list(current_k_info["node_set"])
+            if not current_k_nodes:
                 continue
 
-            stayers = [q for q in cur_k_nodes if nxt_cd.get(q, 0) >= k]
-            leavers = [q for q in cur_k_nodes if nxt_cd.get(q, 0) < k]
+            stayers = [q for q in current_k_nodes if next_cd.get(q, 0) >= k]
+            leavers = [q for q in current_k_nodes if next_cd.get(q, 0) < k]
 
-            n_stayers_sampled = min(max_per_kt, len(stayers))
-            for q in _weighted_sample(rng, stayers, cur_cd, k, n_stayers_sampled):
-                community = _get_community(snaps, t + 1, q, k)
+            stayers_count = min(max_per_kt, len(stayers))
+            for q in _weighted_sample(rng, stayers, current_cd, k, stayers_count):
                 samples.append({
                     "query": q,
                     "k": k,
                     "t": t,
-                    "community": community,
+                    "community": _get_community(snaps, t + 1, q, k),
                 })
 
-            if leavers and n_stayers_sampled > 0:
-                n_empty = min(max(1, n_stayers_sampled // 4), len(leavers))
-                for q in _weighted_sample(rng, leavers, cur_cd, k, n_empty):
+            if leavers and stayers_count > 0:
+                leavers_count = min(
+                    empty_per_kt,
+                    max(1, stayers_count // 4),
+                    len(leavers),
+                )
+                for q in _weighted_sample(
+                    rng, leavers, current_cd, k, leavers_count
+                ):
                     samples.append({
                         "query": q,
                         "k": k,
@@ -129,8 +135,8 @@ def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
                         "community": frozenset(),
                     })
 
-    if dataset_name is not None:
-        SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if cache_path is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as f:
             pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"[community_eval] Cached samples to {cache_path.name}")
@@ -138,29 +144,33 @@ def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
     return samples
 
 
-def build_community_eval_dataset(edge_path,
+def build_community_eval_dataset(slices_dir,
                                  test_ratio=DEFAULT_TEST_RATIO,
-                                 window=None,
                                  max_per_kt=DEFAULT_MAX_PER_KT,
                                  seed=DEFAULT_SEED,
                                  save_dir=None):
-    dataset_name = Path(edge_path).stem
+    if not 0 < test_ratio < 1:
+        raise ValueError("test_ratio must be between 0 and 1")
+    slices_dir = Path(slices_dir)
+    slice_manifest = load_time_slice_manifest(slices_dir)
+    dataset_name = slice_manifest["dataset"]
     valid_ks = DATASET_VALID_KS.get(dataset_name, TARGET_KS)
-    if window is None:
-        window = DATASET_WINDOW.get(dataset_name, WEEK)
-    save_dir = save_dir or SAVE_DIR
+    save_dir = save_dir or slices_dir / "community_eval"
 
-    print(f"[community_eval] Loading {edge_path} ...")
-    snaps, total_nodes = build_snapshots(edge_path, window)
+    print(f"[community_eval] Loading {slices_dir} ...")
+    snaps, total_nodes = build_snapshots(slices_dir)
     print(f"  {len(snaps)} active snapshots, "
           f"max coreness={max(s['max_core'] for s in snaps)}")
 
-    split_ti = int(len(snaps) * 0.7)
-    print(f"  Eval: snaps {split_ti}-{len(snaps) - 1}")
+    split_ti = int(len(snaps) * (1 - test_ratio))
+    if not 0 <= split_ti < len(snaps) - 1:
+        raise ValueError("Community evaluation requires at least two snapshots")
+    print(f"  Eval current snapshots: {split_ti}-{len(snaps) - 2}")
 
     print(f"[community_eval] Sampling (max_per_kt={max_per_kt}, seed={seed}) ...")
     samples = sample_qk_coreness_weighted(
-        snaps, split_ti, valid_ks, max_per_kt, seed=seed, dataset_name=dataset_name
+        snaps, split_ti, valid_ks, max_per_kt, seed=seed, dataset_name=dataset_name,
+        cache_dir=slices_dir / "sample_cache",
     )
     print(f"  {len(samples)} samples collected.")
 
@@ -171,29 +181,25 @@ def build_community_eval_dataset(edge_path,
     per_k_str = ", ".join(f"k={k}:{n}" for k, n in sorted(per_k_counts.items()))
     print(f"  Distribution: {per_k_str}")
 
-    non_empty = sum(1 for s in samples if len(s["community"]) > 0)
-    empty = len(samples) - non_empty
-    print(f"  Non-empty communities: {non_empty}, empty: {empty}")
+    non_empty = sum(1 for sample in samples if sample["community"])
+    print(f"  Non-empty communities: {non_empty}, empty: {len(samples) - non_empty}")
 
     cumulative = {}
-    snap_idx = 0
     ug_adj = {}
-    for t in range(len(snaps)):
-        while snap_idx <= t:
-            for u, v, _ in snaps[snap_idx]["edge_list"]:
-                if u not in cumulative:
-                    cumulative[u] = set()
-                if v not in cumulative:
-                    cumulative[v] = set()
-                cumulative[u].add(v)
-                cumulative[v].add(u)
-            snap_idx += 1
-        ug_adj[t] = {n: list(nb) for n, nb in cumulative.items()}
+    for t, snapshot in enumerate(snaps):
+        for u, v, _ in snapshot["edge_list"]:
+            cumulative.setdefault(u, set()).add(v)
+            cumulative.setdefault(v, set()).add(u)
+        ug_adj[t] = {node: list(neighbors) for node, neighbors in cumulative.items()}
 
     result = {
         "metadata": {
             "valid_ks": valid_ks,
             "total_nodes": total_nodes,
+            "time_slice_config": {
+                "step_seconds": slice_manifest["step_seconds"],
+                "window_seconds": slice_manifest["window_seconds"],
+            },
         },
         "snapshots": snaps,
         "samples": samples,
@@ -214,40 +220,38 @@ def load_community_eval_dataset(path):
         return pickle.load(f)
 
 
-def set_metrics(pred, truth):
-    pred = set(pred)
+def set_metrics(prediction, truth):
+    prediction = set(prediction)
     truth = set(truth)
-    if not pred and not truth:
+    if not prediction and not truth:
         return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "jaccard": 1.0}
-    if not pred or not truth:
+    if not prediction or not truth:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "jaccard": 0.0}
-    inter = len(pred & truth)
-    prec = inter / len(pred)
-    rec = inter / len(truth)
-    f1 = 2 * prec * rec / (prec + rec)
-    jacc = inter / len(pred | truth)
-    return {"precision": prec, "recall": rec, "f1": f1, "jaccard": jacc}
+    intersection_size = len(prediction & truth)
+    precision = intersection_size / len(prediction)
+    recall = intersection_size / len(truth)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": 2 * precision * recall / (precision + recall),
+        "jaccard": intersection_size / len(prediction | truth),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Build community evaluation dataset"
     )
-    parser.add_argument("input", help="Edge list file")
+    parser.add_argument("input", help="Directory generated by datasets.build_time_slices")
     parser.add_argument("--max-per-kt", type=int, default=DEFAULT_MAX_PER_KT)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--window", choices=["day", "3day", "week", "month"],
-                        default=None)
     parser.add_argument("--test-ratio", type=float, default=DEFAULT_TEST_RATIO)
     parser.add_argument("--save-dir", default=None)
     args = parser.parse_args()
 
-    window_map = {"day": DAY, "3day": THREE_DAY, "week": WEEK, "month": MONTH}
-
     build_community_eval_dataset(
         args.input,
         test_ratio=args.test_ratio,
-        window=window_map.get(args.window) if args.window else None,
         max_per_kt=args.max_per_kt,
         seed=args.seed,
         save_dir=args.save_dir,
