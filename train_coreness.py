@@ -47,7 +47,7 @@ def _tensor_dataset(arrays):
 def _feature_cache_name(split, kmax, hmax, config):
     max_nodes = config["max_nodes_per_time"]
     return (
-        f"hybrid_features_v5_{split}_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
+        f"hybrid_features_v6_sg_{split}_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
         f"ik{config['t_ppr_internal_top_k']}_"
         f"o{config['order']}_a{config['t_ppr_alpha']}_"
         f"b{config['t_ppr_beta']}_p{config['min_probability']}_"

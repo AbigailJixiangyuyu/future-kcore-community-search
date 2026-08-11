@@ -110,7 +110,9 @@ class TemporalPPR:
                 position -= 1
             for time, neighbor in interactions[position:group_end]:
                 weighted.append((neighbor, time, group_weight))
-            group_weight *= self.beta ** (group_end - position)
+            # Edges in one snapshot form one recency group. Advancing to the
+            # next older group applies beta once, regardless of group size.
+            group_weight *= self.beta
 
         denominator = sum(weight for _, _, weight in weighted)
         return tuple(
@@ -200,11 +202,11 @@ class TemporalPPR:
     ):
         """Yield top-L answers while scanning snapshots exactly once.
 
-        The maintained state follows Zebra's streaming T-PPR recurrence, with
-        one adaptation for snapshot data: all edges in the same snapshot have
-        equal recency and read the state from before that snapshot. Each node
-        retains at most ``internal_top_k`` temporal states; returned answers
-        are normalized over their first ``top_l`` entries.
+        The maintained state adapts Zebra's streaming T-PPR recurrence to
+        snapshots: all edges in the same snapshot form one recency group,
+        apply beta once to older groups, and read the state from before that
+        snapshot. Each node retains at most ``internal_top_k`` temporal states;
+        returned answers are normalized over their first ``top_l`` entries.
 
         Args:
             queries_by_time: Mapping from snapshot index to source node IDs.
@@ -254,7 +256,9 @@ class TemporalPPR:
             # makes equal-time edges independent of their CSV ordering.
             for node, neighbors in adjacency.items():
                 degree = len(neighbors)
-                decay = self.beta ** degree
+                # One active snapshot is one recency step. Using beta**degree
+                # would make high-degree snapshots erase history excessively.
+                decay = self.beta
                 old_norm = norms.get(node, 0.0)
                 new_norm = decay * old_norm + degree
                 candidates = defaultdict(float)

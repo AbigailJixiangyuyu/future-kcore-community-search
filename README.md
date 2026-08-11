@@ -48,9 +48,11 @@ its width is `order * (hmax + 1)` for `order` in `1..4`.
 
 `methods.t_ppr.TemporalPPR` selects influential historical time-nodes using an
 inverse-time random walk with termination probability `alpha` and recency
-decay `beta`. Feature building scans the snapshots once and incrementally
-maintains each node's internal Top-K T-PPR state. All edges in one snapshot are
-updated simultaneously, so equal-time results do not depend on CSV edge order.
+decay `beta`. Each newer active snapshot group applies `beta` once to older
+interactions, regardless of the number of edges in that group. Feature building
+scans the snapshots once and incrementally maintains each node's internal Top-K
+T-PPR state. All edges in one snapshot are updated simultaneously, so equal-time
+results do not depend on CSV edge order.
 The default internal width is 80, while the model receives normalized Top-L
 attention weights with `L=20`. `top_neighbors(u, t, top_l)` remains available
 as a full per-query reference implementation.
