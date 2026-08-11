@@ -7,10 +7,11 @@ component containing q in the next snapshot `G[t+1]`, using snapshots through
 ## Quick Start
 
 ```bash
-pip install networkit numpy numba
+pip install networkit numpy numba torch
 
 python streaming_eval.py                     # Streaming TCS vs HCU evaluation
 python streaming_eval.py --relax 5           # With dynamic relax threshold
+python train_coreness.py data/mooc/time_slices/step_43200_window_86400
 ```
 
 ## Methods
@@ -28,6 +29,47 @@ TCS(v, t, k) = 1 - (1/W) Σ w_i · (k - c_i) / max(k, c_i)
 
 **HCU (Historical Community Union)** — Baseline that unions all historical
 k-core components containing q through the current snapshot.
+
+For node-level temporal features, `methods.tcs_representation` provides
+`tcs_representation(snapshots, u, t, kmax)`. Snapshot preprocessing determines
+and caches the dataset-level `kmax`; passing that fixed value keeps every
+node's `[TCS(1), ..., TCS(kmax)]` representation the same width. The function
+uses only snapshots through `t` and performs no neighbor aggregation.
+
+For current-snapshot structural features, `methods.h_index_representation`
+provides `structure_representation(snapshots, u, t, order, cmax)`. Snapshot
+preprocessing caches h-index orders 1 through 3 and determines the dataset-level
+maximum first-order h-index `hmax`, which is used as the fixed `cmax`. The
+representation concatenates the
+closed-neighborhood distributions for orders `1..order-1` and current
+coreness, using buckets `0..hmax-1` plus a final `>=hmax` bucket. Because
+`hmax` is the global maximum, the last bucket represents the exact maximum;
+its width is `order * (hmax + 1)` for `order` in `1..4`.
+
+`methods.t_ppr.TemporalPPR` selects influential historical time-nodes using an
+inverse-time random walk with termination probability `alpha` and recency
+decay `beta`. Feature building scans the snapshots once and incrementally
+maintains each node's internal Top-K T-PPR state. All edges in one snapshot are
+updated simultaneously, so equal-time results do not depend on CSV edge order.
+The default internal width is 80, while the model receives normalized Top-L
+attention weights with `L=20`. `top_neighbors(u, t, top_l)` remains available
+as a full per-query reference implementation.
+
+`train_coreness.py` builds causal `(u, t) -> coreness(u, t+1)` samples with a
+70/15/15 chronological split and trains `HybridCorenessPredictor`. The model
+applies a trainable time encoder and shared structural transformation before
+T-PPR weighted aggregation, fuses the result with TCS, and predicts one of the
+fixed classes `0..kmax`. Feature tensors and the final checkpoint are cached
+inside the selected time-slice directory's `model_cache/`. When a per-time
+sample limit is used, nodes are stratified by their observable current
+coreness, including a group for historically seen but currently absent nodes;
+future labels are never used for sampling.
+
+For inference, `build_prediction_samples` and `prepare_feature_arrays` create
+all observable node inputs at a query time, `predict_coreness_map` produces the
+next-snapshot coreness mapping, and `community_from_predicted_coreness` applies
+the `k` threshold, k-core peeling, and connected-component search containing
+`q`.
 
 ## Evaluation Pipeline
 
@@ -51,10 +93,11 @@ artifacts in `data/<dataset>/`. Per-dataset time windows:
 | Dataset | Window | Valid k |
 |---------|--------|---------|
 | email-Eu-core-temporal | week | 3-7 |
-| mooc | day | 3-10 |
-| sx-mathoverflow | 4week | 3-10 |
-| sx-askubuntu | 4week | 3-8 |
-| DBLP1 | year | 3-5 |
+| mooc | day | 3-7 |
+| sx-mathoverflow | 4week | 3-7 |
+| sx-askubuntu | 4week | 3-7 |
+| DBLP1 | year | 3-7 |
+| wiki-talk-temporal | 7day | 3-7 |
 
 ## Time Slices
 
@@ -90,11 +133,17 @@ python streaming_eval.py --step-seconds 604800 --window-seconds 1209600
 
 ```
 streaming_eval.py               # Main entry point
+train_coreness.py               # Hybrid coreness model training entry
 methods/
   tcs_streaming.py              # StreamingTCS class
+  tcs_representation.py         # Fixed-width node temporal features
+  h_index_representation.py     # Multi-order structural features
+  t_ppr.py                      # Temporal-neighbor influence queries
+  hybrid_coreness.py            # Trainable fusion model + community recovery
   hcu.py                        # HCU baseline
 datasets/
   dataset_builder.py            # Snapshot building + caching
+  coreness_prediction_builder.py # Node samples and model feature tensors
   community_eval_builder.py     # Community sample generation + caching
 data/
   <dataset>/

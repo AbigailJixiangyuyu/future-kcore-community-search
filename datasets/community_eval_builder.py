@@ -158,9 +158,8 @@ def build_community_eval_dataset(slices_dir,
     save_dir = save_dir or slices_dir / "community_eval"
 
     print(f"[community_eval] Loading {slices_dir} ...")
-    snaps, total_nodes = build_snapshots(slices_dir)
-    print(f"  {len(snaps)} active snapshots, "
-          f"max coreness={max(s['max_core'] for s in snaps)}")
+    snaps, total_nodes, kmax, _hmax = build_snapshots(slices_dir)
+    print(f"  {len(snaps)} active snapshots, max coreness={kmax}")
 
     split_ti = int(len(snaps) * (1 - test_ratio))
     if not 0 <= split_ti < len(snaps) - 1:
@@ -196,6 +195,7 @@ def build_community_eval_dataset(slices_dir,
         "metadata": {
             "valid_ks": valid_ks,
             "total_nodes": total_nodes,
+            "kmax": kmax,
             "time_slice_config": {
                 "step_seconds": slice_manifest["step_seconds"],
                 "window_seconds": slice_manifest["window_seconds"],

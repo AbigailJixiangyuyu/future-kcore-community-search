@@ -131,7 +131,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"[{dn}] Loading time slices (step={step_seconds}s, window={window_seconds}s) ...")
         t0 = time.time()
-        snaps, total_nodes = build_snapshots(slices_dir)
+        snaps, total_nodes, kmax, _hmax = build_snapshots(slices_dir)
         total_snaps = len(snaps)
         split = int(total_snaps * 0.7)
         if split < 1 or split >= total_snaps - 1:
@@ -142,6 +142,7 @@ def main():
         print(f"  {total_snaps} snapshots, split={split} (70/30)")
         print(f"  Init: G_0..G_{split-1}, Stream: G_{split}..G_{total_snaps-1}")
         print(f"  Total nodes: {total_nodes}")
+        print(f"  Dataset kmax: {kmax}")
         print(f"  Loading took {time.time()-t0:.1f}s")
 
         t0 = time.time()

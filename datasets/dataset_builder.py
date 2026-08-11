@@ -16,6 +16,11 @@ from pathlib import Path
 
 import networkit as nk
 
+from methods.h_index_representation import (
+    MAX_H_INDEX_ORDER,
+    compute_h_index_levels,
+)
+
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
@@ -26,16 +31,16 @@ MONTH = 30 * DAY
 YEAR = 1
 
 DEFAULT_TEST_RATIO = 0.3
-TARGET_KS = [1, 2, 3, 4, 5, 6]
+TARGET_KS = [3, 4, 5, 6, 7]
 
 DATASET_VALID_KS = {
     "email-Eu-core-temporal": [3, 4, 5, 6, 7],
-    "sx-mathoverflow": [3, 4, 5, 6, 7, 8, 9, 10],
-    "sx-askubuntu": [3, 4, 5, 6, 7, 8],
+    "sx-mathoverflow": [3, 4, 5, 6, 7],
+    "sx-askubuntu": [3, 4, 5, 6, 7],
     "mooc": [3, 4, 5, 6, 7],
-    "DBLP1": [3, 4, 5, 6, 7, 8, 9, 10],
+    "DBLP1": [3, 4, 5, 6, 7],
     "wiki-talk-temporal": [3, 4, 5, 6, 7],
-    "sx-superuser": [3, 4, 5, 6],
+    "sx-superuser": [3, 4, 5, 6, 7],
 }
 
 # Recommended default slice configuration for each dataset. These values are
@@ -146,12 +151,42 @@ def _build_snapshot(slice_edges):
             "components": components,
         }
 
-    return {
+    snapshot = {
         "edge_list": [(u, v, min(core_dict[u], core_dict[v])) for u, v, _, _ in filtered_edges],
         "core_dict": core_dict,
         "max_core": max_core,
         "k_core_comps": k_core_comps,
     }
+    _add_h_index_features(snapshot)
+    return snapshot
+
+
+def _add_h_index_features(snapshot):
+    """Add the fixed set of h-index levels used by structural features."""
+    h_index_dicts = compute_h_index_levels(
+        snapshot["edge_list"],
+        snapshot["core_dict"],
+        max_order=MAX_H_INDEX_ORDER,
+    )
+    snapshot["h_index_dicts"] = h_index_dicts
+    snapshot["max_h_index"] = _first_order_hmax(snapshot)
+
+
+def _first_order_hmax(snapshot):
+    """Return the maximum first-order h-index in one snapshot."""
+    first_order = snapshot["h_index_dicts"][1]
+    return max((int(value) for value in first_order.values()), default=0)
+
+
+def _has_h_index_features(snapshot):
+    h_index_dicts = snapshot.get("h_index_dicts")
+    return (
+        isinstance(h_index_dicts, dict)
+        and all(
+            isinstance(h_index_dicts.get(order), dict)
+            for order in range(1, MAX_H_INDEX_ORDER + 1)
+        )
+    )
 
 
 def build_snapshots(slices_dir):
@@ -165,12 +200,60 @@ def build_snapshots(slices_dir):
     manifest = load_time_slice_manifest(slices_dir)
     cache_dir = slices_dir / "snapshot_cache"
     cache_path = cache_dir / "snapshots.pkl"
+    metadata_path = cache_dir / "metadata.json"
 
     if cache_path.exists():
         print(f"[dataset_builder] Loading cached snapshots from {cache_path}")
         with cache_path.open("rb") as cache_file:
             cached = pickle.load(cache_file)
-        return cached["snapshots"], cached["total_nodes"]
+        snapshots = cached["snapshots"]
+        total_nodes = cached["total_nodes"]
+        cache_changed = False
+        for snapshot in snapshots:
+            if not _has_h_index_features(snapshot):
+                _add_h_index_features(snapshot)
+                cache_changed = True
+            max_h_index = _first_order_hmax(snapshot)
+            if snapshot.get("max_h_index") != max_h_index:
+                snapshot["max_h_index"] = max_h_index
+                cache_changed = True
+        kmax = cached.get(
+            "kmax", max((snapshot["max_core"] for snapshot in snapshots), default=0)
+        )
+        hmax = max(
+            (snapshot["max_h_index"] for snapshot in snapshots),
+            default=0,
+        )
+        if cached.get("kmax") != kmax:
+            cache_changed = True
+        if cached.get("hmax") != hmax:
+            cache_changed = True
+        if cache_changed:
+            with cache_path.open("wb") as cache_file:
+                pickle.dump(
+                    {
+                        "snapshots": snapshots,
+                        "total_nodes": total_nodes,
+                        "kmax": kmax,
+                        "hmax": hmax,
+                    },
+                    cache_file,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            print(f"[dataset_builder] Upgraded snapshot cache at {cache_path}")
+        metadata = {
+            "snapshot_count": len(snapshots),
+            "total_nodes": total_nodes,
+            "kmax": kmax,
+            "hmax": hmax,
+            "max_h_index_order": MAX_H_INDEX_ORDER,
+        }
+        if (
+            not metadata_path.exists()
+            or json.loads(metadata_path.read_text()) != metadata
+        ):
+            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+        return snapshots, total_nodes, kmax, hmax
 
     snapshots = []
     total_node_ids = set()
@@ -190,13 +273,34 @@ def build_snapshots(slices_dir):
         snapshots.append(snapshot)
         total_node_ids.update(node for edge in slice_edges for node in edge)
 
+    total_nodes = len(total_node_ids)
+    kmax = max((snapshot["max_core"] for snapshot in snapshots), default=0)
+    hmax = max((snapshot["max_h_index"] for snapshot in snapshots), default=0)
     cache_dir.mkdir(parents=True, exist_ok=True)
     with cache_path.open("wb") as cache_file:
         pickle.dump(
-            {"snapshots": snapshots, "total_nodes": len(total_node_ids)},
+            {
+                "snapshots": snapshots,
+                "total_nodes": total_nodes,
+                "kmax": kmax,
+                "hmax": hmax,
+            },
             cache_file,
             protocol=pickle.HIGHEST_PROTOCOL,
         )
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "snapshot_count": len(snapshots),
+                "total_nodes": total_nodes,
+                "kmax": kmax,
+                "hmax": hmax,
+                "max_h_index_order": MAX_H_INDEX_ORDER,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     print(f"[dataset_builder] Cached snapshots to {cache_path}")
 
-    return snapshots, len(total_node_ids)
+    return snapshots, total_nodes, kmax, hmax
