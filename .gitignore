@@ -32,3 +32,4 @@ wandb/
 *.pt
 *.pth
 *.ckpt
+.zebra_cache/

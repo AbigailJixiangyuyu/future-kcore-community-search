@@ -14,6 +14,31 @@ python streaming_eval.py --relax 5           # With dynamic relax threshold
 python train_coreness.py data/mooc/time_slices/step_43200_window_86400
 ```
 
+### Zebra link-based community prediction
+
+`zebra_community.py` keeps the community target unchanged while using Zebra to
+predict the next graph. Given `(q, k, t)`, it unions q's connected k-core
+communities in snapshots `0..t`, scores every unordered pair in that candidate
+set at `t+1`, retains edges whose bidirectional mean probability is strictly
+greater than `0.5`, and returns q's connected component after k-core
+decomposition.
+
+```bash
+# t is the zero-based coreness snapshot index
+python zebra_community.py query 413 7 52 --device cuda:0
+
+# Non-empty MOOC ground-truth samples in the leakage-free Zebra test period
+python zebra_community.py eval --device cuda:0 \
+  --output outputs/zebra_mooc_community.json
+```
+
+The default MOOC paths use the converted `mooc-snapshot` data and its trained
+checkpoint in the sibling `Zebra` repository. The evaluation start is derived
+from Zebra's 85% time boundary; for the current 60-snapshot MOOC data it is
+`t=52`, predicting snapshot 53 (Zebra timestamp 54). Predicted sparse graphs
+are cached in `.zebra_cache/` using the checkpoint, mapping files, threshold,
+time, and node set as the cache identity.
+
 ## Methods
 
 **StreamingTCS** — Time-decay weighted coreness stability scoring. It filters
