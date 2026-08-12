@@ -1,6 +1,7 @@
 """Trainable hybrid TCS + T-PPR structural coreness predictor."""
 
 from collections import deque
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -147,8 +148,84 @@ def predict_coreness_map(model, feature_arrays, batch_size=512, device=None):
     }
 
 
+@dataclass(frozen=True)
+class LayeredCommunityResult:
+    """Result and work counters for one threshold-driven BFS query."""
+
+    community: frozenset
+    predicted_coreness: dict
+    bfs_layers: int
+    newly_predicted_node_count: int
+
+    @property
+    def predicted_node_count(self):
+        return len(self.predicted_coreness)
+
+    @property
+    def accepted_node_count(self):
+        return len(self.community)
+
+    @property
+    def reused_prediction_count(self):
+        return self.predicted_node_count - self.newly_predicted_node_count
+
+    def with_new_prediction_count(self, count):
+        if count < 0 or count > self.predicted_node_count:
+            raise ValueError("new prediction count is outside the query range")
+        return replace(self, newly_predicted_node_count=count)
+
+
+def layered_threshold_bfs(q, k, adjacency, predict_batch):
+    """Expand from q while batched next-coreness predictions stay >= k."""
+    if k <= 0:
+        raise ValueError("k must be positive")
+
+    predicted = {}
+
+    def predict(nodes):
+        nodes = sorted(set(nodes) - set(predicted))
+        if not nodes:
+            return {}
+        values = predict_batch(nodes)
+        missing = set(nodes) - set(values)
+        extra = set(values) - set(nodes)
+        if missing or extra:
+            raise ValueError(
+                "predict_batch must return exactly the requested nodes"
+            )
+        normalized = {int(node): int(values[node]) for node in nodes}
+        predicted.update(normalized)
+        return normalized
+
+    query_prediction = predict([q])
+    if query_prediction[q] < k:
+        return LayeredCommunityResult(frozenset(), predicted, 1, len(predicted))
+
+    community = {q}
+    frontier = {q}
+    layers = 1
+    while frontier:
+        candidates = set()
+        for node in frontier:
+            candidates.update(adjacency.get(node, ()))
+        candidates.difference_update(predicted)
+        if not candidates:
+            break
+        layer_predictions = predict(candidates)
+        layers += 1
+        frontier = {
+            node for node, coreness in layer_predictions.items()
+            if coreness >= k
+        }
+        community.update(frontier)
+
+    return LayeredCommunityResult(
+        frozenset(community), predicted, layers, len(predicted)
+    )
+
+
 def community_from_predicted_coreness(q, k, t, predicted_coreness, snapshots):
-    """Return q's predicted connected k-core candidate component.
+    """Return q's threshold-connected component in the cumulative graph.
 
     ``predicted_coreness`` maps every candidate node to its predicted coreness
     in ``G_(t+1)``. Connectivity is evaluated on the cumulative union graph
@@ -172,28 +249,12 @@ def community_from_predicted_coreness(q, k, t, predicted_coreness, snapshots):
                 adjacency[u].add(v)
                 adjacency[v].add(u)
 
-    peel_queue = deque(
-        node for node, neighbors in adjacency.items() if len(neighbors) < k
-    )
-    removed = set(peel_queue)
-    while peel_queue:
-        node = peel_queue.popleft()
-        for neighbor in adjacency[node]:
-            if neighbor in removed:
-                continue
-            adjacency[neighbor].discard(node)
-            if len(adjacency[neighbor]) < k:
-                removed.add(neighbor)
-                peel_queue.append(neighbor)
-    if q in removed:
-        return frozenset()
-
     visited = {q}
     queue = deque([q])
     while queue:
         node = queue.popleft()
         for neighbor in adjacency.get(node, ()):
-            if neighbor not in removed and neighbor not in visited:
+            if neighbor not in visited:
                 visited.add(neighbor)
                 queue.append(neighbor)
     return frozenset(visited)

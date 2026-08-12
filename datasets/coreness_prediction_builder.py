@@ -278,3 +278,74 @@ def prepare_feature_arrays(
         t_ppr=t_ppr,
         progress=progress,
     )["samples"]
+
+
+def prepare_inference_feature_arrays(
+    snapshots,
+    nodes,
+    t,
+    kmax,
+    hmax,
+    t_ppr_index,
+    order=4,
+    structure_cache=None,
+    tcs_cache=None,
+    influence_cache=None,
+):
+    """Build model inputs only for the requested nodes at one query time.
+
+    ``t_ppr_index`` must already be advanced to ``t``. The three optional caches
+    are scoped to one query time. Reusing them across queries ensures each
+    node's TCS and Top-L influences, and each temporal node's structure
+    representation, are computed at most once at that time.
+    """
+    if not isinstance(t, int) or t < 0 or t >= len(snapshots):
+        raise IndexError("t is outside the snapshot range")
+    if t_ppr_index.current_time != t:
+        raise ValueError("t_ppr_index must be advanced exactly to t")
+    if kmax <= 0:
+        raise ValueError("kmax must be positive")
+    if hmax < 0:
+        raise ValueError("hmax must be non-negative")
+
+    nodes = np.asarray(sorted(set(nodes)), dtype=np.int64)
+    top_l = t_ppr_index.top_l
+    structure_width = order * (hmax + 1)
+    arrays = _empty_feature_arrays(
+        len(nodes), kmax, top_l, structure_width
+    )
+    structure_cache = structure_cache if structure_cache is not None else {}
+    tcs_cache = tcs_cache if tcs_cache is not None else {}
+    influence_cache = influence_cache if influence_cache is not None else {}
+
+    for index, node_value in enumerate(nodes):
+        node = int(node_value)
+        temporal = tcs_cache.get(node)
+        if temporal is None:
+            temporal = tcs_representation(
+                snapshots, node, t, kmax=kmax
+            ).astype(np.float32, copy=False)
+            tcs_cache[node] = temporal
+        arrays["temporal"][index] = temporal
+        arrays["nodes"][index] = node
+        arrays["times"][index] = t
+        influences = influence_cache.get(node)
+        if influences is None:
+            influences = tuple(t_ppr_index.top_neighbors(node))
+            influence_cache[node] = influences
+        for position, influence in enumerate(influences):
+            structure_key = (influence.node, influence.time)
+            structure = structure_cache.get(structure_key)
+            if structure is None:
+                structure = t_ppr_index.temporal_ppr.structure_feature(
+                    influence.node,
+                    influence.time,
+                    order=order,
+                    cmax=hmax,
+                ).astype(np.float32, copy=False)
+                structure_cache[structure_key] = structure
+            arrays["neighbor_structures"][index, position] = structure
+            arrays["time_deltas"][index, position] = t - influence.time
+            arrays["weights"][index, position] = influence.weight
+            arrays["mask"][index, position] = True
+    return arrays

@@ -28,6 +28,102 @@ class TemporalInfluence:
     weight: float
 
 
+class TemporalPPRStreamingIndex:
+    """Maintain approximate T-PPR state while advancing through snapshots."""
+
+    def __init__(self, temporal_ppr, top_l=20, internal_top_k=80,
+                 min_score=0.0):
+        if not isinstance(top_l, int) or top_l <= 0:
+            raise ValueError("top_l must be a positive integer")
+        if not isinstance(internal_top_k, int) or internal_top_k <= 0:
+            raise ValueError("internal_top_k must be a positive integer")
+        if internal_top_k < top_l:
+            raise ValueError("internal_top_k must be at least top_l")
+        if min_score < 0.0:
+            raise ValueError("min_score must be non-negative")
+        self.temporal_ppr = temporal_ppr
+        self.top_l = top_l
+        self.internal_top_k = internal_top_k
+        self.min_score = float(min_score)
+        self.current_time = -1
+        self._norms = {}
+        self._states = {}
+
+    def advance_to(self, time):
+        """Advance the index to ``time`` without reading future snapshots."""
+        if not isinstance(time, int):
+            raise TypeError("time must be an integer snapshot index")
+        if time < 0:
+            raise IndexError("time must be non-negative")
+        if time < self.current_time:
+            raise ValueError("a streaming T-PPR index cannot move backwards")
+        if time >= len(self.temporal_ppr.snapshots):
+            raise IndexError(
+                "time must be in [0, {}]".format(
+                    len(self.temporal_ppr.snapshots) - 1
+                )
+            )
+
+        for snapshot_time in range(self.current_time + 1, time + 1):
+            adjacency = self.temporal_ppr._snapshot_adjacency[snapshot_time]
+            updates = {}
+            norm_updates = {}
+
+            # All right-hand sides read the state from the preceding snapshot.
+            for node, neighbors in adjacency.items():
+                degree = len(neighbors)
+                decay = self.temporal_ppr.beta
+                old_norm = self._norms.get(node, 0.0)
+                new_norm = decay * old_norm + degree
+                candidates = defaultdict(float)
+
+                if old_norm > 0.0:
+                    old_scale = decay * old_norm / new_norm
+                    for key, score in self._states.get(node, {}).items():
+                        candidates[key] += old_scale * score
+
+                neighbor_scale = (1.0 - self.temporal_ppr.alpha) / new_norm
+                terminal_score = neighbor_scale * self.temporal_ppr.alpha
+                for neighbor in neighbors:
+                    candidates[(neighbor, snapshot_time)] += terminal_score
+                    for key, score in self._states.get(neighbor, {}).items():
+                        candidates[key] += neighbor_scale * score
+
+                updates[node] = dict(self.temporal_ppr._rank_scores(
+                    candidates,
+                    self.internal_top_k,
+                    min_score=self.min_score,
+                ))
+                norm_updates[node] = new_norm
+
+            self._states.update(updates)
+            self._norms.update(norm_updates)
+            self.current_time = snapshot_time
+        return self
+
+    def top_neighbors(self, node):
+        """Return the configured Top-L influences at the current time."""
+        if self.current_time < 0:
+            raise RuntimeError("advance_to must be called before querying")
+        ranked = self.temporal_ppr._rank_scores(
+            self._states.get(node, {}),
+            self.top_l,
+            min_score=self.min_score,
+        )
+        selected_total = sum(score for _, score in ranked)
+        if selected_total == 0.0:
+            return []
+        return [
+            TemporalInfluence(
+                node=target_node,
+                time=target_time,
+                score=score,
+                weight=score / selected_total,
+            )
+            for (target_node, target_time), score in ranked
+        ]
+
+
 class TemporalPPR:
     """Answer causal top-L T-PPR queries over an ordered snapshot sequence."""
 
@@ -241,71 +337,26 @@ class TemporalPPR:
         if not normalized_queries:
             return
 
-        # norm[u] is the sum of recency weights for u's observed interactions.
-        # state[u] stores the approximate T-PPR distribution excluding source u.
-        norms = {}
-        states = {}
+        index = self.streaming_index(
+            top_l=top_l,
+            internal_top_k=internal_top_k,
+            min_score=min_score,
+        )
         last_query_time = max(normalized_queries)
 
         for time in range(last_query_time + 1):
-            adjacency = self._snapshot_adjacency[time]
-            updates = {}
-            norm_updates = {}
-
-            # All right-hand sides read states from time-1. Delaying assignment
-            # makes equal-time edges independent of their CSV ordering.
-            for node, neighbors in adjacency.items():
-                degree = len(neighbors)
-                # One active snapshot is one recency step. Using beta**degree
-                # would make high-degree snapshots erase history excessively.
-                decay = self.beta
-                old_norm = norms.get(node, 0.0)
-                new_norm = decay * old_norm + degree
-                candidates = defaultdict(float)
-
-                if old_norm > 0.0:
-                    old_scale = decay * old_norm / new_norm
-                    for key, score in states.get(node, {}).items():
-                        candidates[key] += old_scale * score
-
-                neighbor_scale = (1.0 - self.alpha) / new_norm
-                terminal_score = neighbor_scale * self.alpha
-                for neighbor in neighbors:
-                    candidates[(neighbor, time)] += terminal_score
-                    for key, score in states.get(neighbor, {}).items():
-                        candidates[key] += neighbor_scale * score
-
-                updates[node] = dict(
-                    self._rank_scores(
-                        candidates,
-                        internal_top_k,
-                        min_score=min_score,
-                    )
-                )
-                norm_updates[node] = new_norm
-
-            states.update(updates)
-            norms.update(norm_updates)
-
+            index.advance_to(time)
             for node in normalized_queries.get(time, ()):
-                ranked = self._rank_scores(
-                    states.get(node, {}),
-                    top_l,
-                    min_score=min_score,
-                )
-                selected_total = sum(score for _, score in ranked)
-                influences = []
-                if selected_total > 0.0:
-                    influences = [
-                        TemporalInfluence(
-                            node=target_node,
-                            time=target_time,
-                            score=score,
-                            weight=score / selected_total,
-                        )
-                        for (target_node, target_time), score in ranked
-                    ]
-                yield node, time, influences
+                yield node, time, index.top_neighbors(node)
+
+    def streaming_index(self, top_l=20, internal_top_k=80, min_score=0.0):
+        """Return a reusable causal index that can advance through time."""
+        return TemporalPPRStreamingIndex(
+            self,
+            top_l=top_l,
+            internal_top_k=internal_top_k,
+            min_score=min_score,
+        )
 
     def structure_feature(self, node, time, order, cmax):
         """Return S_time(node) using the prebuilt snapshot adjacency index."""

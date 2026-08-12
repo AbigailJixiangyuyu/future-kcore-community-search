@@ -14,6 +14,7 @@ by the archived StreamingTCS experiment.
 ```
 coreness-prediction/
 ├── train_coreness.py              # Hybrid coreness model training
+├── hybrid_community.py            # On-demand coreness BFS prediction
 ├── zebra_community.py             # Zebra link-based community prediction
 ├── methods/
 │   ├── hybrid_coreness.py          # Coreness model + community recovery
@@ -38,7 +39,7 @@ coreness-prediction/
 
 ## Active Methods
 
-- **Hybrid coreness prediction** (`methods/hybrid_coreness.py`): Predict next-snapshot node coreness, filter by k, peel the cumulative graph, and return q's connected component.
+- **Hybrid coreness prediction** (`hybrid_community.py`): Traverse the cumulative graph from q, predict each new BFS frontier in batches, and expand only through nodes whose predicted next-snapshot coreness is at least k. Queries at the same time share node-level TCS, T-PPR influence, structure-feature, and predicted-coreness caches, so each touched node is featurized and inferred at most once per time slice. No k-core peeling is applied.
 - **Zebra community prediction** (`zebra_community.py`): Predict links over the historical community candidate set, run k-core decomposition, and return q's connected component.
 - **HCU** (`methods/hcu.py`): Union of q's historical k-core communities through the current snapshot.
 
@@ -72,6 +73,7 @@ Required evaluation scope for subsequent work:
 
 ```bash
 python train_coreness.py data/mooc/time_slices/step_43200_window_86400
+python hybrid_community.py query 413 7 52 --device cuda:0
 python zebra_community.py query 413 7 52 --device cuda:0
 python -m datasets.build_time_slices <dataset> <step_seconds> <window_seconds>
 python -m datasets.community_eval_builder data/<dataset>/time_slices/step_<step>_window_<window>

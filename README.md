@@ -10,6 +10,7 @@ component containing q in the next snapshot `G[t+1]`, using snapshots through
 pip install networkit numpy torch
 
 python train_coreness.py data/mooc/time_slices/step_43200_window_86400
+python hybrid_community.py query 413 7 52 --device cuda:0
 python zebra_community.py query 413 7 52 --device cuda:0
 ```
 
@@ -40,10 +41,10 @@ time, and node set as the cache identity.
 
 ## Methods
 
-**Hybrid coreness prediction** — Predicts every observable node's coreness in
-the next snapshot. Community recovery retains nodes with predicted coreness at
-least `k`, performs k-core peeling on the cumulative historical graph, and
-returns the surviving connected component containing q.
+**Hybrid coreness prediction** — Runs a layered BFS from q over the cumulative
+historical graph. Each layer predicts next-snapshot coreness only for newly
+reached nodes; nodes predicted at least `k` join the result and expose the next
+layer. No additional k-core peeling is applied.
 
 **Zebra link prediction** — Predicts the next graph over q's historical
 community candidate set, then performs k-core decomposition and returns q's
@@ -92,26 +93,32 @@ sample limit is used, nodes are stratified by their observable current
 coreness, including a group for historically seen but currently absent nodes;
 future labels are never used for sampling.
 
-For inference, `build_prediction_samples` and `prepare_feature_arrays` create
-all observable node inputs at a query time, `predict_coreness_map` produces the
-next-snapshot coreness mapping, and `community_from_predicted_coreness` applies
-the `k` threshold, k-core peeling, and connected-component search containing
-`q`.
+For inference, `hybrid_community.py` builds one cumulative adjacency and T-PPR
+state through the query time. It predicts `q` first, then deduplicates each BFS
+frontier, creates features only for those nodes, and sends them to the model in
+bounded batches. At one query time, TCS vectors, T-PPR Top-L influences,
+structure features, and predicted coreness values are cached by node and shared
+across all `(q, k)` queries. A node is therefore featurized and inferred at most
+once per time slice while BFS still avoids untouched nodes. The CLI reports both
+examined nodes and new model predictions.
 
 ## Community Recovery
 
 1. Build `slice_*.csv` files from the raw edge list with `datasets.build_time_slices`.
 2. Load those slice files and construct cached k-core snapshots.
-3. Use either the hybrid model to predict next-snapshot node coreness or Zebra
-   to predict next-snapshot links.
-4. Recover the connected k-core component containing q from the corresponding
-   predicted structure.
+3. Use either the hybrid model to predict next-snapshot node coreness on demand
+   during BFS or Zebra to predict next-snapshot links.
+4. Hybrid returns q's threshold-connected BFS region; Zebra recovers q's
+   connected k-core component from its predicted graph.
 5. Compare the predicted vertex set with the true connected k-core component;
    the main experiment evaluates samples whose true next community is non-empty.
 6. Report F1, Precision, Recall, community size ratio, and prediction ratio per k.
 
 Snapshots, test samples, and persisted evaluation sets are cached inside the
 specific `time_slices/step_<step>_window_<window>/` directory that produced them.
+
+The completed MOOC comparison between Hybrid and Zebra is documented in
+[`docs/mooc-community-evaluation-results.md`](docs/mooc-community-evaluation-results.md).
 
 ## Data Format
 
@@ -152,6 +159,8 @@ Build the required time slices before training or evaluation.
 ```bash
 python -m datasets.build_time_slices mooc 43200 86400
 python train_coreness.py data/mooc/time_slices/step_43200_window_86400
+python hybrid_community.py eval --device cuda:0 \
+  --output outputs/hybrid_mooc_community.json
 python zebra_community.py eval --device cuda:0 \
   --output outputs/zebra_mooc_community.json
 ```
@@ -160,6 +169,7 @@ python zebra_community.py eval --device cuda:0 \
 
 ```
 train_coreness.py               # Hybrid coreness model training entry
+hybrid_community.py             # On-demand coreness BFS query/evaluation
 zebra_community.py              # Zebra link-based community prediction
 methods/
   tcs_representation.py         # Fixed-width node temporal features
