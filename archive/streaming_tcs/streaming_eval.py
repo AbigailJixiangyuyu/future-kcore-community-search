@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Streaming next-snapshot k-core community evaluation."""
+"""Archived StreamingTCS versus HCU community evaluation."""
 import os
 import sys
 import time
 import multiprocessing as mp
+from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from datasets.dataset_builder import (
     DATASET_VALID_KS,
@@ -21,9 +23,9 @@ from datasets.community_eval_builder import (
     sample_qk_coreness_weighted,
     set_metrics,
 )
-from methods.tcs_streaming import StreamingTCS
 from methods.hcu import predict as hcu_predict, reset_hcu_profile, get_hcu_profile
-import eval.worker as worker
+from archive.streaming_tcs.tcs_streaming import StreamingTCS
+from archive.streaming_tcs import worker
 
 
 def _print_table(header, valid_ks, per_k):

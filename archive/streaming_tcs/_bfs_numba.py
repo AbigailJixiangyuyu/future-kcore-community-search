@@ -1,3 +1,5 @@
+"""Numba kernels retained for the archived StreamingTCS implementation."""
+
 import numpy as np
 from numba import njit
 

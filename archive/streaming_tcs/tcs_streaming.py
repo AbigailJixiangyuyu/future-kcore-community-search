@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from collections import deque
-from methods._bfs_numba import _bfs_csr_numba, _merge_sorted_dedup
+from archive.streaming_tcs._bfs_numba import _bfs_csr_numba, _merge_sorted_dedup
 
 
 class StreamingTCS:

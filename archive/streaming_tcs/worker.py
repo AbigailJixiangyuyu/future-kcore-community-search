@@ -1,6 +1,4 @@
-import os, sys, time
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import time
 
 from datasets.community_eval_builder import set_metrics
 from methods.hcu import predict as predict_hcu

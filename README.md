@@ -7,11 +7,10 @@ component containing q in the next snapshot `G[t+1]`, using snapshots through
 ## Quick Start
 
 ```bash
-pip install networkit numpy numba torch
+pip install networkit numpy torch
 
-python streaming_eval.py                     # Streaming TCS vs HCU evaluation
-python streaming_eval.py --relax 5           # With dynamic relax threshold
 python train_coreness.py data/mooc/time_slices/step_43200_window_86400
+python zebra_community.py query 413 7 52 --device cuda:0
 ```
 
 ### Zebra link-based community prediction
@@ -41,19 +40,20 @@ time, and node set as the cache identity.
 
 ## Methods
 
-**StreamingTCS** — Time-decay weighted coreness stability scoring. It filters
-unstable nodes and runs BFS on the cumulative union graph to predict q's
-community.
+**Hybrid coreness prediction** — Predicts every observable node's coreness in
+the next snapshot. Community recovery retains nodes with predicted coreness at
+least `k`, performs k-core peeling on the cumulative historical graph, and
+returns the surviving connected component containing q.
 
-```
-TCS(v, t, k) = 1 - (1/W) Σ w_i · (k - c_i) / max(k, c_i)
-```
-
-- α = 0.7 (decay), τ = 0.15 (fixed) or dynamic relax threshold
-- 70/30 train-test split, incremental ingest during evaluation
+**Zebra link prediction** — Predicts the next graph over q's historical
+community candidate set, then performs k-core decomposition and returns q's
+connected component.
 
 **HCU (Historical Community Union)** — Baseline that unions all historical
 k-core components containing q through the current snapshot.
+
+The former **StreamingTCS** community search method is archived under
+`archive/streaming_tcs/` and is not part of the active evaluation pipeline.
 
 For node-level temporal features, `methods.tcs_representation` provides
 `tcs_representation(snapshots, u, t, kmax)`. Snapshot preprocessing determines
@@ -98,13 +98,14 @@ next-snapshot coreness mapping, and `community_from_predicted_coreness` applies
 the `k` threshold, k-core peeling, and connected-component search containing
 `q`.
 
-## Evaluation Pipeline
+## Community Recovery
 
 1. Build `slice_*.csv` files from the raw edge list with `datasets.build_time_slices`.
 2. Load those slice files and construct cached k-core snapshots.
-3. Initialize StreamingTCS on the first 70% snapshots.
-4. For each current snapshot `G[t]`, ingest it and predict the k-core community
-   containing q in `G[t+1]`.
+3. Use either the hybrid model to predict next-snapshot node coreness or Zebra
+   to predict next-snapshot links.
+4. Recover the connected k-core component containing q from the corresponding
+   predicted structure.
 5. Compare the predicted vertex set with the true connected k-core component;
    the main experiment evaluates samples whose true next community is non-empty.
 6. Report F1, Precision, Recall, community size ratio, and prediction ratio per k.
@@ -146,28 +147,26 @@ end of the timeline. Each dataset keeps one active slice configuration. A
 successful rebuild replaces its previous `time_slices` directory, including
 stale snapshot, sample, and evaluation caches derived from the old slices.
 
-Build the required time slices before running the evaluation. With no slice
-arguments, `streaming_eval.py` uses each dataset's configured default window as
-both step and window length.
+Build the required time slices before training or evaluation.
 
 ```bash
-python streaming_eval.py
-python streaming_eval.py --dataset mooc --step-seconds 86400 --window-seconds 172800
-python streaming_eval.py --step-seconds 604800 --window-seconds 1209600
+python -m datasets.build_time_slices mooc 43200 86400
+python train_coreness.py data/mooc/time_slices/step_43200_window_86400
+python zebra_community.py eval --device cuda:0 \
+  --output outputs/zebra_mooc_community.json
 ```
 
 ## Project Structure
 
 ```
-streaming_eval.py               # Main entry point
 train_coreness.py               # Hybrid coreness model training entry
+zebra_community.py              # Zebra link-based community prediction
 methods/
-  tcs_streaming.py              # StreamingTCS class
   tcs_representation.py         # Fixed-width node temporal features
   h_index_representation.py     # Multi-order structural features
   t_ppr.py                      # Temporal-neighbor influence queries
   hybrid_coreness.py            # Trainable fusion model + community recovery
-  hcu.py                        # HCU baseline
+  hcu.py                        # Historical community union baseline
 datasets/
   dataset_builder.py            # Snapshot building + caching
   coreness_prediction_builder.py # Node samples and model feature tensors
@@ -182,6 +181,6 @@ data/
         snapshot_cache/         # Derived k-core snapshots
         sample_cache/           # Derived test samples
         community_eval/         # Optional persisted evaluation set
-eval/
-  worker.py                     # Parallel evaluation workers
+archive/
+  streaming_tcs/                # Retired StreamingTCS implementation and evaluator
 ```

@@ -6,17 +6,19 @@ the next snapshot.
 
 ## Tech Stack
 
-Python 3, networkit, NumPy, Numba. Multiprocessing via `concurrent.futures`.
+Python 3, networkit, NumPy, PyTorch. Numba and multiprocessing are retained only
+by the archived StreamingTCS experiment.
 
 ## Directory Structure
 
 ```
 coreness-prediction/
-├── streaming_eval.py              # Main entry: streaming TCS vs HCU evaluation
+├── train_coreness.py              # Hybrid coreness model training
+├── zebra_community.py             # Zebra link-based community prediction
 ├── methods/
-│   ├── tcs_streaming.py           # StreamingTCS class (incremental score + ingest)
-│   ├── _bfs_numba.py              # Numba-accelerated BFS kernels
-│   └── hcu.py                     # HCU baseline (historical community union)
+│   ├── hybrid_coreness.py          # Coreness model + community recovery
+│   ├── tcs_representation.py       # Node-level temporal features
+│   └── hcu.py                      # HCU baseline (historical community union)
 ├── datasets/
 │   ├── dataset_builder.py         # Snapshot building + caching (networkit-based)
 │   ├── community_eval_builder.py  # Community test sample generation + caching
@@ -29,16 +31,19 @@ coreness-prediction/
 │               ├── snapshot_cache/  # Cached k-core snapshots
 │               ├── sample_cache/    # Cached test samples
 │               └── community_eval/  # Persisted evaluation set (optional)
-├── eval/
-│   └── worker.py                  # Parallel eval workers for streaming methods
+├── archive/streaming_tcs/         # Retired StreamingTCS code and evaluator
 ├── docs/                          # Project documentation
 └── specs/                         # Change specifications and archives
 ```
 
 ## Active Methods
 
-- **StreamingTCS** (`methods/tcs_streaming.py`): Time-decay weighted coreness stability scoring + BFS on the cumulative union graph. Supports fixed τ or dynamic relax threshold. 70/30 split, incremental ingest.
+- **Hybrid coreness prediction** (`methods/hybrid_coreness.py`): Predict next-snapshot node coreness, filter by k, peel the cumulative graph, and return q's connected component.
+- **Zebra community prediction** (`zebra_community.py`): Predict links over the historical community candidate set, run k-core decomposition, and return q's connected component.
 - **HCU** (`methods/hcu.py`): Union of q's historical k-core communities through the current snapshot.
+
+StreamingTCS is retired. Its implementation and old comparison evaluator are
+available only under `archive/streaming_tcs/` for reproducibility.
 
 ## TCS Formula
 
@@ -66,8 +71,8 @@ Required evaluation scope for subsequent work:
 ## Commands
 
 ```bash
-python streaming_eval.py                     # Main experiment (streaming TCS vs HCU)
-python streaming_eval.py --relax 5           # Dynamic relax threshold
+python train_coreness.py data/mooc/time_slices/step_43200_window_86400
+python zebra_community.py query 413 7 52 --device cuda:0
 python -m datasets.build_time_slices <dataset> <step_seconds> <window_seconds>
 python -m datasets.community_eval_builder data/<dataset>/time_slices/step_<step>_window_<window>
 ```
