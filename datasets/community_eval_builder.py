@@ -26,6 +26,7 @@ Usage (library):
 import argparse
 import os
 import pickle
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,9 @@ from datasets.dataset_builder import (
 
 DEFAULT_MAX_PER_KT = 20
 DEFAULT_SEED = 42
+DATASET_SAMPLE_FRACTIONS = {
+    "wiki-talk-temporal": 1 / 6,
+}
 
 
 def _get_community(snaps, t, q, k):
@@ -64,13 +68,72 @@ def _weighted_sample(rng, candidates, cur_cd, k, n):
     return [candidates[i] for i in chosen_idx]
 
 
+def _resolve_sample_fraction(dataset_name, sample_fraction):
+    if sample_fraction is None:
+        sample_fraction = DATASET_SAMPLE_FRACTIONS.get(dataset_name, 1.0)
+    sample_fraction = float(sample_fraction)
+    if not 0 < sample_fraction <= 1:
+        raise ValueError("sample_fraction must be in (0, 1]")
+    return sample_fraction
+
+
+def _fraction_cache_suffix(sample_fraction):
+    if sample_fraction == 1.0:
+        return ""
+    numerator, denominator = (
+        Fraction(sample_fraction).limit_denominator().as_integer_ratio()
+    )
+    return f"_f{numerator}of{denominator}"
+
+
 def _sample_cache_key(dataset_name, split_ti, valid_ks, max_per_kt,
-                      empty_per_kt, seed):
+                      empty_per_kt, seed, sample_fraction=1.0):
     ks_str = "_".join(str(k) for k in sorted(valid_ks))
+    fraction_suffix = _fraction_cache_suffix(sample_fraction)
     return (
         f"community_samples_v1_{dataset_name}_split{split_ti}_k{ks_str}_"
-        f"n{max_per_kt}_e{empty_per_kt}_s{seed}.pkl"
+        f"n{max_per_kt}_e{empty_per_kt}_s{seed}{fraction_suffix}.pkl"
     )
+
+
+def stratified_downsample(samples, sample_fraction, seed=DEFAULT_SEED):
+    """Select an exact fraction while preserving (t, k, truth-empty) strata."""
+    sample_fraction = _resolve_sample_fraction(None, sample_fraction)
+    if sample_fraction == 1.0 or not samples:
+        return list(samples)
+
+    target_size = max(1, round(len(samples) * sample_fraction))
+    strata = {}
+    for index, sample in enumerate(samples):
+        key = (sample["t"], sample["k"], not bool(sample["community"]))
+        strata.setdefault(key, []).append(index)
+
+    rng = np.random.RandomState(seed)
+    allocations = {}
+    remainders = []
+    allocated = 0
+    for key, indices in sorted(strata.items()):
+        exact = len(indices) * sample_fraction
+        count = int(np.floor(exact))
+        allocations[key] = count
+        allocated += count
+        remainders.append((exact - count, rng.random_sample(), key))
+
+    for _remainder, _tie_breaker, key in sorted(
+        remainders, key=lambda item: (-item[0], item[1])
+    )[:target_size - allocated]:
+        allocations[key] += 1
+
+    selected = []
+    for key, indices in sorted(strata.items()):
+        count = allocations[key]
+        if count == len(indices):
+            selected.extend(indices)
+        elif count:
+            selected.extend(
+                rng.choice(indices, size=count, replace=False).tolist()
+            )
+    return [samples[index] for index in sorted(selected)]
 
 
 def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
@@ -78,19 +141,39 @@ def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
                                 empty_per_kt=5,
                                 seed=DEFAULT_SEED,
                                 dataset_name=None,
-                                cache_dir=None):
+                                cache_dir=None,
+                                sample_fraction=None):
     if not 0 <= split_ti < len(snaps) - 1:
         raise ValueError("Community evaluation requires a current and next snapshot")
+    sample_fraction = _resolve_sample_fraction(dataset_name, sample_fraction)
     cache_path = None
     if dataset_name is not None and cache_dir is not None:
         cache_key = _sample_cache_key(dataset_name, split_ti, valid_ks,
-                                      max_per_kt, empty_per_kt, seed)
+                                      max_per_kt, empty_per_kt, seed,
+                                      sample_fraction)
         cache_dir = Path(cache_dir)
         cache_path = cache_dir / cache_key
         if cache_path.exists():
             print(f"[community_eval] Loading cached samples from {cache_path.name}")
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
+
+        full_cache_path = cache_dir / _sample_cache_key(
+            dataset_name, split_ti, valid_ks, max_per_kt, empty_per_kt, seed
+        )
+        if sample_fraction < 1.0 and full_cache_path.exists():
+            print(
+                "[community_eval] Downsampling cached samples from "
+                f"{full_cache_path.name}"
+            )
+            with open(full_cache_path, "rb") as f:
+                samples = pickle.load(f)
+            samples = stratified_downsample(samples, sample_fraction, seed)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[community_eval] Cached samples to {cache_path.name}")
+            return samples
 
     rng = np.random.RandomState(seed)
     samples = []
@@ -135,6 +218,8 @@ def sample_qk_coreness_weighted(snaps, split_ti, valid_ks,
                         "community": frozenset(),
                     })
 
+    samples = stratified_downsample(samples, sample_fraction, seed)
+
     if cache_path is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as f:
@@ -148,12 +233,14 @@ def build_community_eval_dataset(slices_dir,
                                  test_ratio=DEFAULT_TEST_RATIO,
                                  max_per_kt=DEFAULT_MAX_PER_KT,
                                  seed=DEFAULT_SEED,
-                                 save_dir=None):
+                                 save_dir=None,
+                                 sample_fraction=None):
     if not 0 < test_ratio < 1:
         raise ValueError("test_ratio must be between 0 and 1")
     slices_dir = Path(slices_dir)
     slice_manifest = load_time_slice_manifest(slices_dir)
     dataset_name = slice_manifest["dataset"]
+    sample_fraction = _resolve_sample_fraction(dataset_name, sample_fraction)
     valid_ks = DATASET_VALID_KS.get(dataset_name, TARGET_KS)
     save_dir = save_dir or slices_dir / "community_eval"
 
@@ -166,10 +253,14 @@ def build_community_eval_dataset(slices_dir,
         raise ValueError("Community evaluation requires at least two snapshots")
     print(f"  Eval current snapshots: {split_ti}-{len(snaps) - 2}")
 
-    print(f"[community_eval] Sampling (max_per_kt={max_per_kt}, seed={seed}) ...")
+    print(
+        "[community_eval] Sampling "
+        f"(max_per_kt={max_per_kt}, fraction={sample_fraction:g}, seed={seed}) ..."
+    )
     samples = sample_qk_coreness_weighted(
         snaps, split_ti, valid_ks, max_per_kt, seed=seed, dataset_name=dataset_name,
         cache_dir=slices_dir / "sample_cache",
+        sample_fraction=sample_fraction,
     )
     print(f"  {len(samples)} samples collected.")
 
@@ -183,17 +274,10 @@ def build_community_eval_dataset(slices_dir,
     non_empty = sum(1 for sample in samples if sample["community"])
     print(f"  Non-empty communities: {non_empty}, empty: {len(samples) - non_empty}")
 
-    cumulative = {}
-    ug_adj = {}
-    for t, snapshot in enumerate(snaps):
-        for u, v, _ in snapshot["edge_list"]:
-            cumulative.setdefault(u, set()).add(v)
-            cumulative.setdefault(v, set()).add(u)
-        ug_adj[t] = {node: list(neighbors) for node, neighbors in cumulative.items()}
-
     result = {
         "metadata": {
             "valid_ks": valid_ks,
+            "sample_fraction": sample_fraction,
             "total_nodes": total_nodes,
             "kmax": kmax,
             "time_slice_config": {
@@ -201,15 +285,15 @@ def build_community_eval_dataset(slices_dir,
                 "window_seconds": slice_manifest["window_seconds"],
             },
         },
-        "snapshots": snaps,
         "samples": samples,
-        "ug_adj": ug_adj,
     }
 
     os.makedirs(save_dir, exist_ok=True)
     pkl_path = os.path.join(save_dir, f"{dataset_name}.pkl")
-    with open(pkl_path, "wb") as f:
+    temp_path = f"{pkl_path}.tmp"
+    with open(temp_path, "wb") as f:
         pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temp_path, pkl_path)
     print(f"[community_eval] Saved to {pkl_path}")
 
     return result
@@ -246,6 +330,7 @@ def main():
     parser.add_argument("--max-per-kt", type=int, default=DEFAULT_MAX_PER_KT)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--test-ratio", type=float, default=DEFAULT_TEST_RATIO)
+    parser.add_argument("--sample-fraction", type=float, default=None)
     parser.add_argument("--save-dir", default=None)
     args = parser.parse_args()
 
@@ -255,6 +340,7 @@ def main():
         max_per_kt=args.max_per_kt,
         seed=args.seed,
         save_dir=args.save_dir,
+        sample_fraction=args.sample_fraction,
     )
 
 

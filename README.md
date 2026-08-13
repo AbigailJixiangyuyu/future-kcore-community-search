@@ -7,11 +7,23 @@ component containing q in the next snapshot `G[t+1]`, using snapshots through
 ## Quick Start
 
 ```bash
-pip install networkit numpy torch
+pip install networkit numba numpy torch
 
 python train_coreness.py data/mooc/time_slices/step_43200_window_86400
 python hybrid_community.py query 413 7 52 --device cuda:0
 python zebra_community.py query 413 7 52 --device cuda:0
+```
+
+Hybrid streaming state can be checkpointed before evaluation without
+materializing model features. The default cache time is the 70% evaluation
+boundary; later `query` and `eval` commands automatically load the newest
+compatible cache at or before their query time.
+
+```bash
+python hybrid_community.py build-state-cache \
+  --slices-dir data/wiki-talk-temporal/time_slices/step_259200_window_604800 \
+  --checkpoint data/wiki-talk-temporal/time_slices/step_259200_window_604800/model_cache/hybrid_coreness.pt \
+  --device cpu --time 343
 ```
 
 ### Zebra link-based community prediction

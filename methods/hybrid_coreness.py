@@ -148,6 +148,75 @@ def predict_coreness_map(model, feature_arrays, batch_size=512, device=None):
     }
 
 
+def predict_coreness_indexed_map(
+    model,
+    feature_table,
+    structure_table,
+    nodes,
+    batch_size=512,
+    device=None,
+):
+    """Predict requested nodes by gathering precomputed time-slice rows."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    requested = np.asarray(sorted(set(nodes)), dtype=np.int64)
+    if not len(requested):
+        return {}
+
+    node_rows = feature_table.get("node_rows")
+    if node_rows is None:
+        table_nodes = feature_table["nodes"]
+        rows = np.searchsorted(table_nodes, requested)
+        if (
+            np.any(rows >= len(table_nodes))
+            or not np.array_equal(table_nodes[rows], requested)
+        ):
+            raise KeyError("requested nodes are missing from the feature table")
+    else:
+        try:
+            rows = np.fromiter(
+                (node_rows[int(node)] for node in requested),
+                dtype=np.int64,
+                count=len(requested),
+            )
+        except KeyError as error:
+            raise KeyError(
+                "requested nodes are missing from the feature table"
+            ) from error
+    if device is None:
+        device = next(model.parameters()).device
+    device = torch.device(device)
+
+    predictions = []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(requested), batch_size):
+            end = min(start + batch_size, len(requested))
+            batch_rows = rows[start:end]
+            structure_indices = feature_table["structure_indices"][batch_rows]
+            structure_values = getattr(
+                structure_table, "values", structure_table
+            )
+            inputs = [
+                torch.from_numpy(feature_table["temporal"][batch_rows]).to(device),
+                torch.from_numpy(
+                    np.asarray(structure_values[structure_indices])
+                ).to(device),
+                torch.from_numpy(
+                    feature_table["time_deltas"][batch_rows]
+                ).to(device),
+                torch.from_numpy(feature_table["weights"][batch_rows]).to(device),
+                torch.from_numpy(feature_table["mask"][batch_rows]).to(device),
+            ]
+            predictions.append(model.predict_coreness(*inputs).cpu().numpy())
+
+    values = np.concatenate(predictions)
+    return {
+        int(node): int(coreness)
+        for node, coreness in zip(requested, values)
+    }
+
+
 @dataclass(frozen=True)
 class LayeredCommunityResult:
     """Result and work counters for one threshold-driven BFS query."""

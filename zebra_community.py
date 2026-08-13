@@ -5,22 +5,25 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import networkit as nk
 import numpy as np
 from scipy import sparse
 import torch
+import torch.nn.functional as F
 
 from datasets.community_eval_builder import (
     sample_qk_coreness_weighted,
     set_metrics,
 )
-from datasets.dataset_builder import build_snapshots
+from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +40,18 @@ DEFAULT_CHECKPOINT = (
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_PAIR_BATCH_SIZE = 65536
 CACHE_VERSION = 1
+EMBEDDING_CACHE_VERSION = 1
+PROGRESSIVE_RESULT_VERSION = 1
+PROGRESSIVE_KS = (7, 6, 5, 4, 3)
+COMMUNITY_METRICS = (
+    "precision",
+    "recall",
+    "f1",
+    "jaccard",
+    "size_ratio",
+    "pred_ratio",
+    "elapsed_s",
+)
 
 # Networkit 11.0.1 still looks up this NumPy alias when bulk-loading COO edges.
 if "ulong" not in np.__dict__:
@@ -82,6 +97,159 @@ def _upper_triangle_batches(node_count, batch_size):
                 buffered = 0
     if buffered:
         yield np.concatenate(left_parts), np.concatenate(right_parts)
+
+
+class _ProjectedUndirectedDecoder:
+    """Exactly reuse the node-wise terms of Zebra's first decoder layer."""
+
+    def __init__(self, zebra, embeddings):
+        with torch.no_grad():
+            affinity = zebra.model.affinity_score
+            embedding_dim = embeddings.shape[1]
+            if affinity.fc1.in_features != 2 * embedding_dim:
+                raise ValueError("Zebra decoder input does not match embeddings")
+            first_weight = affinity.fc1.weight
+            self.left_projection = F.linear(
+                embeddings,
+                first_weight[:, :embedding_dim],
+                affinity.fc1.bias,
+            )
+            self.right_projection = F.linear(
+                embeddings,
+                first_weight[:, embedding_dim:],
+            )
+        self.output_layer = affinity.fc2
+
+    def _directed(self, left, right):
+        hidden = F.relu(
+            self.left_projection[left] + self.right_projection[right]
+        )
+        return self.output_layer(hidden).squeeze(dim=1).sigmoid()
+
+    def score(self, left, right):
+        with torch.no_grad():
+            forward = self._directed(left, right)
+            reverse = self._directed(right, left)
+            return (forward + reverse) / 2
+
+
+def _build_projected_decoder(zebra, embeddings):
+    model = getattr(zebra, "model", None)
+    affinity = getattr(model, "affinity_score", None)
+    if affinity is None or not hasattr(affinity, "fc1") or not hasattr(
+        affinity, "fc2"
+    ):
+        return None
+    return _ProjectedUndirectedDecoder(zebra, embeddings)
+
+
+def _now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _atomic_write_text(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(path.name + ".tmp")
+    with temporary_path.open("w") as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary_path.replace(path)
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    raise TypeError(
+        "Object of type {} is not JSON serializable".format(
+            value.__class__.__name__
+        )
+    )
+
+
+def _atomic_write_json(path, payload):
+    _atomic_write_text(
+        path,
+        json.dumps(
+            payload, default=_json_default, indent=2, sort_keys=True
+        ) + "\n",
+    )
+
+
+def _atomic_save_npy(path, array):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(path.name + ".tmp")
+    with temporary_path.open("wb") as output:
+        np.save(output, array, allow_pickle=False)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary_path.replace(path)
+
+
+def _sample_identifier(sample):
+    return "{}:{}:{}".format(
+        int(sample["t"]), int(sample["k"]), int(sample["query"])
+    )
+
+
+def _prepare_progressive_samples(samples, snapshots, start_t, end_t,
+                                 ks=PROGRESSIVE_KS):
+    k_order = {k: position for position, k in enumerate(ks)}
+    prepared = []
+    identifiers = set()
+    for sample in samples:
+        t = int(sample["t"])
+        k = int(sample["k"])
+        if not sample["community"] or t < start_t or t > end_t or k not in k_order:
+            continue
+        candidate = historical_community_union(
+            snapshots, int(sample["query"]), k, t
+        )
+        identifier = _sample_identifier(sample)
+        if identifier in identifiers:
+            raise ValueError("duplicate progressive sample: {}".format(identifier))
+        identifiers.add(identifier)
+        node_count = len(candidate)
+        prepared.append({
+            **sample,
+            "sample_id": identifier,
+            "candidate": candidate,
+            "candidate_size": node_count,
+            "pair_count": node_count * (node_count - 1) // 2,
+        })
+    return sorted(
+        prepared,
+        key=lambda sample: (
+            k_order[sample["k"]],
+            sample["candidate_size"],
+            sample["t"],
+            sample["query"],
+        ),
+    )
+
+
+def _progressive_run_signature(predictor, samples, start_t, end_t):
+    digest = hashlib.sha256()
+    digest.update(np.int64(PROGRESSIVE_RESULT_VERSION).tobytes())
+    digest.update(np.int64(EMBEDDING_CACHE_VERSION).tobytes())
+    digest.update(predictor.checkpoint_hash.encode("ascii"))
+    digest.update(predictor.config_hash.encode("ascii"))
+    digest.update(predictor.mapping_hash.encode("ascii"))
+    digest.update(np.float64(predictor.threshold).tobytes())
+    digest.update(np.int64(start_t).tobytes())
+    digest.update(np.int64(end_t).tobytes())
+    for sample in samples:
+        digest.update(sample["sample_id"].encode("ascii"))
+        digest.update(np.asarray(
+            sorted(sample["candidate"]), dtype=np.int64
+        ).tobytes())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -268,50 +436,90 @@ class ZebraCommunityPredictor:
         digest.update(np.asarray(original_nodes, dtype=np.int64).tobytes())
         return self.cache_dir / "{}.npz".format(digest.hexdigest())
 
-    def predict_graph(self, original_nodes, t):
-        """Predict all unordered edges over nodes using history through t."""
-        if t < 0 or t >= len(self.snapshots) - 1:
-            raise IndexError("prediction requires both t and t+1 snapshots")
-        original_nodes = np.asarray(sorted(set(original_nodes)), dtype=np.int64)
-        cache_path = self._cache_path(original_nodes, t)
-        if cache_path is not None and cache_path.is_file():
-            return PredictedGraph(
-                original_nodes,
-                sparse.load_npz(str(cache_path)).tocsr(),
-            )
-        if len(original_nodes) == 0:
-            adjacency = sparse.csr_matrix((0, 0), dtype=np.bool_)
-            return PredictedGraph(original_nodes, adjacency)
-
+    def _mapped_nodes(self, original_nodes):
         try:
-            zebra_nodes = np.fromiter(
+            return np.fromiter(
                 (self.original_to_zebra[int(node)] for node in original_nodes),
                 dtype=np.int32,
                 count=len(original_nodes),
             )
         except KeyError as error:
-            raise ValueError("candidate node is absent from node_mapping.csv") from error
+            raise ValueError(
+                "candidate node is absent from node_mapping.csv"
+            ) from error
 
-        observed_timestamp = self.time_to_zebra[t]
-        query_timestamp = self.time_to_zebra[t + 1]
-        self.zebra.replay_until(observed_timestamp)
-        embeddings = self.zebra.encode_nodes(zebra_nodes, query_timestamp)
+    def encode_original_nodes(self, original_nodes, t):
+        if t < 0 or t >= len(self.snapshots) - 1:
+            raise IndexError("prediction requires both t and t+1 snapshots")
+        original_nodes = np.asarray(
+            sorted(set(original_nodes)), dtype=np.int64
+        )
+        if len(original_nodes) == 0:
+            hidden_dim = self.zebra.config["node_dim"] * (
+                len(self.zebra.config["alpha_list"]) + 1
+            )
+            return original_nodes, np.empty(
+                (0, hidden_dim), dtype=np.float32
+            )
+        zebra_nodes = self._mapped_nodes(original_nodes)
+        self.zebra.replay_until(self.time_to_zebra[t])
+        embeddings = self.zebra.encode_nodes(
+            zebra_nodes, self.time_to_zebra[t + 1]
+        )
+        return original_nodes, embeddings.detach().cpu().numpy().astype(
+            np.float32, copy=False
+        )
 
+    def predict_graph_from_embeddings(self, original_nodes, embeddings,
+                                      progress_callback=None):
+        original_nodes = np.asarray(original_nodes, dtype=np.int64)
+        embeddings = torch.as_tensor(
+            np.asarray(embeddings), dtype=torch.float32, device=self.zebra.device
+        )
+        if embeddings.ndim != 2 or embeddings.shape[0] != len(original_nodes):
+            raise ValueError("cached embeddings do not match candidate nodes")
+        return self._decode_graph(
+            original_nodes, embeddings, progress_callback=progress_callback
+        )
+
+    def _decode_graph(self, original_nodes, embeddings,
+                      progress_callback=None):
+        if len(original_nodes) == 0:
+            adjacency = sparse.csr_matrix((0, 0), dtype=np.bool_)
+            return PredictedGraph(original_nodes, adjacency)
+
+        total_pairs = len(original_nodes) * (len(original_nodes) - 1) // 2
+        projected_decoder = _build_projected_decoder(self.zebra, embeddings)
         edge_left = []
         edge_right = []
+        completed_pairs = 0
         for left, right in _upper_triangle_batches(
             len(original_nodes), self.pair_batch_size
         ):
             left_index = torch.from_numpy(left).long().to(self.zebra.device)
             right_index = torch.from_numpy(right).long().to(self.zebra.device)
-            probabilities = self.zebra.score_undirected_embeddings(
-                embeddings[left_index], embeddings[right_index]
-            )
+            if projected_decoder is None:
+                probabilities = self.zebra.score_undirected_embeddings(
+                    embeddings[left_index], embeddings[right_index]
+                )
+            else:
+                probabilities = projected_decoder.score(
+                    left_index, right_index
+                )
             selected = probabilities.gt(self.threshold).cpu().numpy()
             if selected.any():
                 edge_left.append(left[selected].astype(np.int32, copy=False))
                 edge_right.append(right[selected].astype(np.int32, copy=False))
+            completed_pairs += len(left)
+            if progress_callback is not None:
+                progress_callback(completed_pairs, total_pairs)
 
+        if completed_pairs != total_pairs:
+            raise RuntimeError(
+                "decoded {} of {} unordered node pairs".format(
+                    completed_pairs, total_pairs
+                )
+            )
         if edge_left:
             left = np.concatenate(edge_left)
             right = np.concatenate(edge_right)
@@ -329,11 +537,35 @@ class ZebraCommunityPredictor:
                 (len(original_nodes), len(original_nodes)), dtype=np.bool_
             )
         adjacency.eliminate_zeros()
+        return PredictedGraph(original_nodes, adjacency)
+
+    def predict_graph(self, original_nodes, t):
+        """Predict all unordered edges over nodes using history through t."""
+        if t < 0 or t >= len(self.snapshots) - 1:
+            raise IndexError("prediction requires both t and t+1 snapshots")
+        original_nodes = np.asarray(sorted(set(original_nodes)), dtype=np.int64)
+        cache_path = self._cache_path(original_nodes, t)
+        if cache_path is not None and cache_path.is_file():
+            return PredictedGraph(
+                original_nodes,
+                sparse.load_npz(str(cache_path)).tocsr(),
+            )
+        if len(original_nodes) == 0:
+            adjacency = sparse.csr_matrix((0, 0), dtype=np.bool_)
+            return PredictedGraph(original_nodes, adjacency)
+        zebra_nodes = self._mapped_nodes(original_nodes)
+        self.zebra.replay_until(self.time_to_zebra[t])
+        embeddings = self.zebra.encode_nodes(
+            zebra_nodes, self.time_to_zebra[t + 1]
+        )
+        graph = self._decode_graph(original_nodes, embeddings)
         if cache_path is not None:
             temporary_path = cache_path.with_suffix(".tmp.npz")
-            sparse.save_npz(str(temporary_path), adjacency, compressed=True)
+            sparse.save_npz(
+                str(temporary_path), graph.adjacency, compressed=True
+            )
             temporary_path.replace(cache_path)
-        return PredictedGraph(original_nodes, adjacency)
+        return graph
 
     def predict(self, q, k, t):
         candidate = self.candidate(q, k, t)
@@ -401,14 +633,464 @@ def _aggregate(rows):
     return result
 
 
+def _sample_result_path(work_dir, sample):
+    return Path(work_dir) / "samples" / "t{:06d}_k{}_q{}.json".format(
+        int(sample["t"]), int(sample["k"]), int(sample["query"])
+    )
+
+
+def _load_completed_records(work_dir, samples, run_signature):
+    records = {}
+    for sample in samples:
+        result_path = _sample_result_path(work_dir, sample)
+        if not result_path.is_file():
+            continue
+        try:
+            record = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            continue
+        if (
+            record.get("run_signature") != run_signature
+            or record.get("sample_id") != sample["sample_id"]
+            or int(record.get("pair_count", -1)) != sample["pair_count"]
+        ):
+            continue
+        records[sample["sample_id"]] = record
+    return records
+
+
+def _aggregate_completed_records(records):
+    result = {}
+    for name in COMMUNITY_METRICS:
+        result[name] = float(np.mean([record[name] for record in records]))
+    result["samples"] = len(records)
+    result["predicted_edge_count"] = int(sum(
+        record["predicted_edge_count"] for record in records
+    ))
+    result["scored_pair_count"] = int(sum(
+        record["pair_count"] for record in records
+    ))
+    return result
+
+
+def _build_progress_payload(dataset_name, predictor, samples, records,
+                            run_signature, start_t, end_t, started_at,
+                            current=None, phase="scoring"):
+    current = current or {}
+    per_k = {}
+    completed_metrics = []
+    for k in PROGRESSIVE_KS:
+        k_samples = [sample for sample in samples if sample["k"] == k]
+        k_records = [
+            records[sample["sample_id"]]
+            for sample in k_samples
+            if sample["sample_id"] in records
+        ]
+        complete = len(k_records) == len(k_samples)
+        status = "complete" if complete else "pending"
+        if current.get("k") == k and not complete:
+            status = "running"
+        metrics = (
+            _aggregate_completed_records(k_records)
+            if complete and k_samples
+            else {name: "INF" for name in COMMUNITY_METRICS}
+        )
+        if complete and k_samples:
+            completed_metrics.append(metrics)
+        current_pairs = (
+            int(current.get("sample_pairs_completed", 0))
+            if (
+                current.get("k") == k
+                and current.get("sample_id") not in records
+            ) else 0
+        )
+        per_k[str(k)] = {
+            "status": status,
+            "samples_total": len(k_samples),
+            "samples_completed": len(k_records),
+            "pairs_total": int(sum(
+                sample["pair_count"] for sample in k_samples
+            )),
+            "pairs_completed": int(sum(
+                record["pair_count"] for record in k_records
+            )) + current_pairs,
+            "metrics": metrics,
+        }
+
+    macro = {name: "INF" for name in COMMUNITY_METRICS}
+    if len(completed_metrics) == len(PROGRESSIVE_KS):
+        macro = {
+            name: float(np.mean([
+                metrics[name] for metrics in completed_metrics
+            ]))
+            for name in COMMUNITY_METRICS
+        }
+    return {
+        "version": PROGRESSIVE_RESULT_VERSION,
+        "dataset": dataset_name,
+        "run_signature": run_signature,
+        "checkpoint": str(Path(predictor.zebra.checkpoint_path).resolve()),
+        "threshold": predictor.threshold,
+        "pair_batch_size": predictor.pair_batch_size,
+        "sample_scope": {
+            "start_t": start_t,
+            "end_t": end_t,
+            "non_empty_only": True,
+            "validation_leakage_warning": start_t < predictor.test_start_t,
+            "strict_zebra_test_start_t": predictor.test_start_t,
+            "samples": len(samples),
+        },
+        "execution_order": {
+            "k": list(PROGRESSIVE_KS),
+            "within_k": "candidate_size_ascending",
+            "all_unordered_pairs": True,
+        },
+        "phase": phase,
+        "started_at": started_at,
+        "updated_at": _now(),
+        "samples_completed": len(records),
+        "current": current,
+        "per_k": per_k,
+        "macro": macro,
+    }
+
+
+def _format_metric(value):
+    if value == "INF":
+        return "INF"
+    return "{:.6f}".format(float(value))
+
+
+def _write_comparison_markdown(path, zebra_payload, hybrid_result_path=None):
+    hybrid = None
+    if hybrid_result_path and Path(hybrid_result_path).is_file():
+        try:
+            hybrid = json.loads(Path(hybrid_result_path).read_text())
+        except (OSError, ValueError):
+            hybrid = None
+    lines = [
+        "# WikiTalk Community Prediction Evaluation",
+        "",
+        "- Samples: non-empty ground-truth communities, t={}..{}.".format(
+            zebra_payload["sample_scope"]["start_t"],
+            zebra_payload["sample_scope"]["end_t"],
+        ),
+        "- Zebra order: k=7,6,5,4,3; candidate size ascending.",
+        "- `INF` means that the complete k-level evaluation has not finished.",
+        "- The selected range overlaps Zebra validation data before t={}.".format(
+            zebra_payload["sample_scope"]["strict_zebra_test_start_t"]
+        ),
+        "",
+        "| Method | k | Status | Samples | Precision | Recall | F1 | Jaccard |",
+        "|---|---:|---|---:|---:|---:|---:|---:|",
+    ]
+    for method in ("Hybrid", "Zebra"):
+        for k in PROGRESSIVE_KS:
+            if method == "Zebra":
+                row = zebra_payload["per_k"][str(k)]
+                metrics = row["metrics"]
+                status = row["status"]
+                samples = "{}/{}".format(
+                    row["samples_completed"], row["samples_total"]
+                )
+            elif hybrid and str(k) in hybrid.get("per_k", {}):
+                metrics = hybrid["per_k"][str(k)]
+                status = "complete"
+                samples = str(metrics["samples"])
+            elif hybrid and k in hybrid.get("per_k", {}):
+                metrics = hybrid["per_k"][k]
+                status = "complete"
+                samples = str(metrics["samples"])
+            else:
+                metrics = {name: "INF" for name in COMMUNITY_METRICS}
+                status = "running" if method == "Hybrid" else "pending"
+                samples = "0"
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    method,
+                    k,
+                    status,
+                    samples,
+                    _format_metric(metrics["precision"]),
+                    _format_metric(metrics["recall"]),
+                    _format_metric(metrics["f1"]),
+                    _format_metric(metrics["jaccard"]),
+                )
+            )
+    _atomic_write_text(path, "\n".join(lines) + "\n")
+
+
+def _embedding_paths(embedding_dir, t):
+    prefix = Path(embedding_dir) / "t{:06d}".format(t)
+    return (
+        prefix.with_name(prefix.name + "_nodes.npy"),
+        prefix.with_name(prefix.name + "_embeddings.npy"),
+    )
+
+
+def _valid_embedding_cache(nodes_path, embeddings_path, expected_nodes):
+    if not nodes_path.is_file() or not embeddings_path.is_file():
+        return False
+    try:
+        nodes = np.load(nodes_path, mmap_mode="r", allow_pickle=False)
+        embeddings = np.load(
+            embeddings_path, mmap_mode="r", allow_pickle=False
+        )
+    except (OSError, ValueError):
+        return False
+    return (
+        nodes.dtype == np.int64
+        and nodes.shape == expected_nodes.shape
+        and np.array_equal(nodes, expected_nodes)
+        and embeddings.dtype == np.float32
+        and embeddings.ndim == 2
+        and embeddings.shape[0] == len(nodes)
+    )
+
+
+def _prepare_embedding_cache(predictor, samples, embedding_dir,
+                             status_callback=None):
+    nodes_by_time = defaultdict(set)
+    for sample in samples:
+        nodes_by_time[sample["t"]].update(sample["candidate"])
+    expected = {
+        t: np.asarray(sorted(nodes), dtype=np.int64)
+        for t, nodes in nodes_by_time.items()
+    }
+    missing_times = []
+    for t, nodes in sorted(expected.items()):
+        nodes_path, embeddings_path = _embedding_paths(embedding_dir, t)
+        if not _valid_embedding_cache(nodes_path, embeddings_path, nodes):
+            missing_times.append(t)
+    if not missing_times:
+        return expected
+
+    missing = set(missing_times)
+    for index, (t, nodes) in enumerate(sorted(expected.items()), start=1):
+        if status_callback:
+            status_callback({
+                "embedding_time": t,
+                "embedding_times_completed": index - 1,
+                "embedding_times_total": len(expected),
+                "embedding_nodes": len(nodes),
+            })
+        predictor.zebra.replay_until(predictor.time_to_zebra[t])
+        if t not in missing:
+            continue
+        zebra_nodes = predictor._mapped_nodes(nodes)
+        embeddings = predictor.zebra.encode_nodes(
+            zebra_nodes, predictor.time_to_zebra[t + 1]
+        ).detach().cpu().numpy().astype(np.float32, copy=False)
+        nodes_path, embeddings_path = _embedding_paths(embedding_dir, t)
+        _atomic_save_npy(nodes_path, nodes)
+        _atomic_save_npy(embeddings_path, embeddings)
+    return expected
+
+
+def _load_candidate_embeddings(embedding_dir, sample):
+    nodes_path, embeddings_path = _embedding_paths(
+        embedding_dir, sample["t"]
+    )
+    all_nodes = np.load(nodes_path, mmap_mode="r", allow_pickle=False)
+    all_embeddings = np.load(
+        embeddings_path, mmap_mode="r", allow_pickle=False
+    )
+    candidate_nodes = np.asarray(
+        sorted(sample["candidate"]), dtype=np.int64
+    )
+    positions = np.searchsorted(all_nodes, candidate_nodes)
+    if (
+        len(positions)
+        and (
+            positions[-1] >= len(all_nodes)
+            or not np.array_equal(all_nodes[positions], candidate_nodes)
+        )
+    ):
+        raise ValueError("candidate nodes are missing from embedding cache")
+    return candidate_nodes, np.asarray(all_embeddings[positions])
+
+
+def _progressive_evaluate(args):
+    predictor, total_nodes = _build_predictor(args)
+    manifest = load_time_slice_manifest(args.slices_dir)
+    dataset_name = manifest["dataset"]
+    split_t = int(len(predictor.snapshots) * 0.7)
+    end_t = (
+        len(predictor.snapshots) - 2
+        if args.end_t is None else args.end_t
+    )
+    raw_samples = sample_qk_coreness_weighted(
+        predictor.snapshots,
+        split_t,
+        [3, 4, 5, 6, 7],
+        dataset_name=dataset_name,
+        cache_dir=Path(args.slices_dir) / "sample_cache",
+    )
+    samples = _prepare_progressive_samples(
+        raw_samples, predictor.snapshots, args.start_t, end_t
+    )
+    if not samples:
+        raise ValueError("no non-empty community samples in the selected range")
+
+    work_dir = Path(args.work_dir)
+    progress_path = Path(args.output)
+    comparison_path = Path(args.comparison_output)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    run_signature = _progressive_run_signature(
+        predictor, samples, args.start_t, end_t
+    )
+    run_metadata_path = work_dir / "run.json"
+    if run_metadata_path.is_file():
+        existing = json.loads(run_metadata_path.read_text())
+        if existing.get("run_signature") != run_signature:
+            raise ValueError(
+                "work directory belongs to a different progressive run"
+            )
+        if not args.resume:
+            raise FileExistsError(
+                "progressive run already exists; pass --resume to continue"
+            )
+    else:
+        _atomic_write_json(run_metadata_path, {
+            "run_signature": run_signature,
+            "created_at": _now(),
+            "dataset": dataset_name,
+        })
+
+    embedding_dir = Path(args.embedding_cache_dir) / run_signature[:16]
+    embedding_dir.mkdir(parents=True, exist_ok=True)
+    records = _load_completed_records(work_dir, samples, run_signature)
+    started_at = _now()
+    if progress_path.is_file():
+        try:
+            previous_progress = json.loads(progress_path.read_text())
+            if previous_progress.get("run_signature") == run_signature:
+                started_at = previous_progress.get("started_at", started_at)
+        except (OSError, ValueError):
+            pass
+    last_status_update = [0.0]
+
+    def publish(current=None, phase="scoring", force=False):
+        now = time.time()
+        if not force and now - last_status_update[0] < args.status_interval:
+            return
+        payload = _build_progress_payload(
+            dataset_name,
+            predictor,
+            samples,
+            records,
+            run_signature,
+            args.start_t,
+            end_t,
+            started_at,
+            current=current,
+            phase=phase,
+        )
+        _atomic_write_json(progress_path, payload)
+        _write_comparison_markdown(
+            comparison_path, payload, args.hybrid_result
+        )
+        last_status_update[0] = now
+
+    publish(phase="embedding_cache", force=True)
+
+    def embedding_status(current):
+        publish(current=current, phase="embedding_cache")
+
+    _prepare_embedding_cache(
+        predictor, samples, embedding_dir, embedding_status
+    )
+    publish(phase="scoring", force=True)
+
+    for sample_index, sample in enumerate(samples, start=1):
+        if sample["sample_id"] in records:
+            continue
+        sample_started = time.time()
+        current = {
+            "sample_index": sample_index,
+            "sample_total": len(samples),
+            "sample_id": sample["sample_id"],
+            "q": int(sample["query"]),
+            "k": int(sample["k"]),
+            "t": int(sample["t"]),
+            "candidate_size": sample["candidate_size"],
+            "sample_pair_count": sample["pair_count"],
+            "sample_pairs_completed": 0,
+        }
+
+        def pair_status(completed_pairs, total_pairs):
+            current["sample_pairs_completed"] = int(completed_pairs)
+            current["sample_pair_count"] = int(total_pairs)
+            publish(current=current, phase="scoring")
+
+        candidate_nodes, embeddings = _load_candidate_embeddings(
+            embedding_dir, sample
+        )
+        graph = predictor.predict_graph_from_embeddings(
+            candidate_nodes, embeddings, progress_callback=pair_status
+        )
+        prediction = graph.community(
+            candidate_nodes, int(sample["query"]), int(sample["k"])
+        )
+        metrics = set_metrics(prediction, sample["community"])
+        record = {
+            "run_signature": run_signature,
+            "sample_id": sample["sample_id"],
+            "q": int(sample["query"]),
+            "k": int(sample["k"]),
+            "t": int(sample["t"]),
+            "candidate_size": sample["candidate_size"],
+            "pair_count": sample["pair_count"],
+            "predicted_edge_count": graph.edge_count,
+            "prediction_size": len(prediction),
+            "truth_size": len(sample["community"]),
+            "prediction": sorted(prediction),
+            **metrics,
+            "size_ratio": len(prediction) / len(sample["community"]),
+            "pred_ratio": len(prediction) / total_nodes * 100,
+            "elapsed_s": time.time() - sample_started,
+            "completed_at": _now(),
+        }
+        _atomic_write_json(_sample_result_path(work_dir, sample), record)
+        records[sample["sample_id"]] = record
+        current["sample_pairs_completed"] = sample["pair_count"]
+        publish(phase="scoring", force=True)
+        print(
+            "completed {}/{} sample={} nodes={} pairs={} edges={} elapsed_s={:.3f}".format(
+                len(records),
+                len(samples),
+                sample["sample_id"],
+                sample["candidate_size"],
+                sample["pair_count"],
+                graph.edge_count,
+                record["elapsed_s"],
+            ),
+            flush=True,
+        )
+
+    publish(phase="complete", force=True)
+
+
+def _progressive_status(args):
+    progress_path = Path(args.progress)
+    if not progress_path.is_file():
+        raise FileNotFoundError(
+            "progress file not found: {}".format(progress_path)
+        )
+    payload = json.loads(progress_path.read_text())
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def _evaluate(args):
     predictor, total_nodes = _build_predictor(args)
+    manifest = load_time_slice_manifest(args.slices_dir)
+    dataset_name = manifest["dataset"]
     start_t = predictor.test_start_t if args.start_t is None else args.start_t
     samples = sample_qk_coreness_weighted(
         predictor.snapshots,
         int(len(predictor.snapshots) * 0.7),
         [3, 4, 5, 6, 7],
-        dataset_name="mooc",
+        dataset_name=dataset_name,
         cache_dir=Path(args.slices_dir) / "sample_cache",
     )
     samples = [
@@ -465,7 +1147,7 @@ def _evaluate(args):
                 result[name] for result in per_k.values()
             ]))
     result = {
-        "dataset": "mooc",
+        "dataset": dataset_name,
         "start_t": start_t,
         "threshold": predictor.threshold,
         "samples": len(samples),
@@ -513,6 +1195,50 @@ def main():
     eval_parser.add_argument("--max-samples", type=int, default=None)
     eval_parser.add_argument("--output", default=None)
     eval_parser.set_defaults(handler=_evaluate)
+
+    progressive_parser = subparsers.add_parser("progressive-eval")
+    _add_common_arguments(progressive_parser)
+    progressive_parser.add_argument("--start-t", type=int, default=343)
+    progressive_parser.add_argument("--end-t", type=int, default=None)
+    progressive_parser.add_argument(
+        "--work-dir", default=str(ROOT / "results/wiki_talk/zebra_work")
+    )
+    progressive_parser.add_argument(
+        "--embedding-cache-dir",
+        default=str(ROOT / ".zebra_embedding_cache"),
+    )
+    progressive_parser.add_argument(
+        "--output",
+        default=str(
+            ROOT / "results/wiki_talk/zebra_community_eval_progress.json"
+        ),
+    )
+    progressive_parser.add_argument(
+        "--comparison-output",
+        default=str(
+            ROOT / "results/wiki_talk/community_eval_comparison.md"
+        ),
+    )
+    progressive_parser.add_argument(
+        "--hybrid-result",
+        default=str(
+            ROOT / "results/wiki_talk/hybrid_community_eval.json"
+        ),
+    )
+    progressive_parser.add_argument(
+        "--status-interval", type=float, default=30.0
+    )
+    progressive_parser.add_argument("--resume", action="store_true")
+    progressive_parser.set_defaults(handler=_progressive_evaluate)
+
+    status_parser = subparsers.add_parser("progressive-status")
+    status_parser.add_argument(
+        "--progress",
+        default=str(
+            ROOT / "results/wiki_talk/zebra_community_eval_progress.json"
+        ),
+    )
+    status_parser.set_defaults(handler=_progressive_status)
 
     args = parser.parse_args()
     args.handler(args)

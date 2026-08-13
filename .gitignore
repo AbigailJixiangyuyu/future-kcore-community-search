@@ -33,3 +33,7 @@ wandb/
 *.pth
 *.ckpt
 .zebra_cache/
+.zebra_embedding_cache/
+results/*/zebra_work/
+
+run_logs/

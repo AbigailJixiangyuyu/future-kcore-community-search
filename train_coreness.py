@@ -36,7 +36,7 @@ def _set_seed(seed):
 def _tensor_dataset(arrays):
     return TensorDataset(
         torch.from_numpy(arrays["temporal"]),
-        torch.from_numpy(arrays["neighbor_structures"]),
+        torch.from_numpy(arrays["structure_indices"]),
         torch.from_numpy(arrays["time_deltas"]),
         torch.from_numpy(arrays["weights"]),
         torch.from_numpy(arrays["mask"]),
@@ -44,15 +44,31 @@ def _tensor_dataset(arrays):
     )
 
 
-def _feature_cache_name(split, kmax, hmax, config):
+def _model_batch(batch, structure_table, device):
+    """Gather one batch's shared structure rows and move inputs to device."""
+    temporal, structure_indices, time_deltas, weights, mask, target = batch
+    neighbor_structures = torch.from_numpy(
+        np.asarray(structure_table[structure_indices.numpy()])
+    )
+    features = [
+        temporal.to(device),
+        neighbor_structures.to(device),
+        time_deltas.to(device),
+        weights.to(device),
+        mask.to(device),
+    ]
+    return features, target.to(device)
+
+
+def _feature_cache_stem(kmax, hmax, config):
     max_nodes = config["max_nodes_per_time"]
     return (
-        f"hybrid_features_v6_sg_{split}_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
+        f"hybrid_features_v7_indexed_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
         f"ik{config['t_ppr_internal_top_k']}_"
         f"o{config['order']}_a{config['t_ppr_alpha']}_"
         f"b{config['t_ppr_beta']}_p{config['min_probability']}_"
         f"tr{config['train_ratio']}_vr{config['val_ratio']}_"
-        f"s{config['seed']}.npz"
+        f"s{config['seed']}"
     )
 
 
@@ -65,11 +81,16 @@ def _load_or_prepare_features(
     config,
     t_ppr,
 ):
+    cache_stem = _feature_cache_stem(kmax, hmax, config)
     cache_paths = {
-        split: cache_dir / _feature_cache_name(split, kmax, hmax, config)
+        split: cache_dir / f"{cache_stem}_{split}.npz"
         for split in samples_by_split
     }
-    if all(path.exists() for path in cache_paths.values()):
+    structure_cache_path = cache_dir / f"{cache_stem}_structures.npy"
+    if (
+        structure_cache_path.exists()
+        and all(path.exists() for path in cache_paths.values())
+    ):
         arrays = {}
         for split, cache_path in cache_paths.items():
             print(f"[features] Loading {split}: {cache_path}")
@@ -77,7 +98,11 @@ def _load_or_prepare_features(
                 arrays[split] = {
                     name: cached[name] for name in cached.files
                 }
-        return arrays
+        print(f"[features] Loading structures: {structure_cache_path}")
+        structure_table = np.load(
+            str(structure_cache_path), mmap_mode="r", allow_pickle=False
+        )
+        return arrays, structure_table
 
     print(
         "[features] Building all splits with one incremental T-PPR scan: "
@@ -94,7 +119,8 @@ def _load_or_prepare_features(
             print(f"  incremental features: {done}/{total}")
             last_report[0] = now
 
-    arrays = prepare_feature_arrays_by_split(
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    arrays, structure_table = prepare_feature_arrays_by_split(
         snapshots,
         samples_by_split,
         kmax=kmax,
@@ -107,13 +133,22 @@ def _load_or_prepare_features(
         min_probability=config["min_probability"],
         t_ppr=t_ppr,
         progress=report,
+        structure_table_path=structure_cache_path,
     )
-    cache_dir.mkdir(parents=True, exist_ok=True)
     for split, split_arrays in arrays.items():
         cache_path = cache_paths[split]
         np.savez_compressed(str(cache_path), **split_arrays)
         print(f"[features] Cached {split}: {cache_path}")
-    return arrays
+    print(
+        f"[features] Cached {len(structure_table)} shared structures: "
+        f"{structure_cache_path}"
+    )
+    if isinstance(structure_table, np.memmap):
+        del structure_table
+        structure_table = np.load(
+            str(structure_cache_path), mmap_mode="r", allow_pickle=False
+        )
+    return arrays, structure_table
 
 
 def _class_weights(labels, class_count):
@@ -144,14 +179,14 @@ def _binary_metrics(prediction, truth):
     }
 
 
-def evaluate_model(model, loader, criterion, device, kmax):
+def evaluate_model(model, loader, structure_table, criterion, device, kmax):
     model.eval()
     total_loss = 0.0
     predictions = []
     labels = []
     with torch.no_grad():
         for batch in loader:
-            *features, target = [tensor.to(device) for tensor in batch]
+            features, target = _model_batch(batch, structure_table, device)
             logits = model(*features)
             total_loss += criterion(logits, target).item() * target.size(0)
             predictions.append(logits.argmax(dim=1).cpu().numpy())
@@ -229,7 +264,7 @@ def train(args):
         beta=args.t_ppr_beta,
     )
     cache_dir = slices_dir / "model_cache" / "features"
-    arrays = _load_or_prepare_features(
+    arrays, structure_table = _load_or_prepare_features(
         cache_dir,
         samples,
         snapshots,
@@ -279,7 +314,7 @@ def train(args):
         total_loss = 0.0
         total_count = 0
         for batch in loaders["train"]:
-            *features, target = [tensor.to(device) for tensor in batch]
+            features, target = _model_batch(batch, structure_table, device)
             optimizer.zero_grad()
             logits = model(*features)
             loss = criterion(logits, target)
@@ -289,7 +324,7 @@ def train(args):
             total_count += target.size(0)
 
         validation = evaluate_model(
-            model, loaders["val"], criterion, device, kmax
+            model, loaders["val"], structure_table, criterion, device, kmax
         )
         print(
             f"[epoch {epoch:03d}] train_loss={total_loss / total_count:.4f} "
@@ -307,8 +342,12 @@ def train(args):
                 break
 
     model.load_state_dict(best_state)
-    validation = evaluate_model(model, loaders["val"], criterion, device, kmax)
-    test = evaluate_model(model, loaders["test"], criterion, device, kmax)
+    validation = evaluate_model(
+        model, loaders["val"], structure_table, criterion, device, kmax
+    )
+    test = evaluate_model(
+        model, loaders["test"], structure_table, criterion, device, kmax
+    )
     _print_metrics("validation", validation)
     _print_metrics("test", test)
 
@@ -348,7 +387,7 @@ def build_parser():
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--max-nodes-per-time", type=int, default=2000)
     parser.add_argument("--top-l", type=int, default=20)
-    parser.add_argument("--t-ppr-internal-top-k", type=int, default=80)
+    parser.add_argument("--t-ppr-internal-top-k", type=int, default=20)
     parser.add_argument("--order", type=int, default=4)
     parser.add_argument("--t-ppr-alpha", type=float, default=0.3)
     parser.add_argument("--t-ppr-beta", type=float, default=0.5)

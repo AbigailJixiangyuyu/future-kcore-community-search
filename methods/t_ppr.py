@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from numba import njit, prange
 
 from methods.h_index_representation import structure_representation
 
@@ -28,10 +29,166 @@ class TemporalInfluence:
     weight: float
 
 
+@njit(inline="always")
+def _insert_temporal_candidate(
+    hash_nodes, hash_times, hash_scores, node, time, score
+):
+    """Insert or aggregate one ``(node, time)`` candidate."""
+    mask = len(hash_times) - 1
+    slot = (node * 1000003 + time) & mask
+    while True:
+        if hash_times[slot] == -1:
+            hash_nodes[slot] = node
+            hash_times[slot] = time
+            hash_scores[slot] = score
+            return
+        if hash_nodes[slot] == node and hash_times[slot] == time:
+            hash_scores[slot] += score
+            return
+        slot = (slot + 1) & mask
+
+
+@njit(inline="always")
+def _is_better_candidate(
+    score, time, node, ranked_score, ranked_time, ranked_node
+):
+    """Apply the deterministic T-PPR ranking order."""
+    if score != ranked_score:
+        return score > ranked_score
+    if time != ranked_time:
+        return time > ranked_time
+    return node < ranked_node
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _update_source_rows(
+    active_rows,
+    adjacency_offsets,
+    neighbor_rows,
+    all_nodes,
+    state_nodes,
+    state_times,
+    state_scores,
+    state_lengths,
+    norms,
+    snapshot_time,
+    alpha,
+    beta,
+    min_score,
+    output_nodes,
+    output_times,
+    output_scores,
+    output_lengths,
+    output_norms,
+):
+    """Update active sources independently from the preceding state."""
+    width = state_nodes.shape[1]
+    for source_position in prange(len(active_rows)):
+        source_row = active_rows[source_position]
+        edge_start = adjacency_offsets[source_position]
+        edge_end = adjacency_offsets[source_position + 1]
+        degree = edge_end - edge_start
+        old_norm = norms[source_row]
+        new_norm = beta * old_norm + degree
+        output_norms[source_position] = new_norm
+
+        candidate_count = state_lengths[source_row]
+        candidate_count += degree
+        for edge_position in range(edge_start, edge_end):
+            candidate_count += state_lengths[neighbor_rows[edge_position]]
+
+        hash_capacity = 1
+        while hash_capacity < 2 * candidate_count:
+            hash_capacity *= 2
+        hash_nodes = np.zeros(hash_capacity, dtype=np.int64)
+        hash_times = np.full(hash_capacity, -1, dtype=np.int32)
+        hash_scores = np.zeros(hash_capacity, dtype=np.float64)
+
+        if old_norm > 0.0:
+            old_scale = beta * old_norm / new_norm
+            for position in range(state_lengths[source_row]):
+                _insert_temporal_candidate(
+                    hash_nodes,
+                    hash_times,
+                    hash_scores,
+                    state_nodes[source_row, position],
+                    state_times[source_row, position],
+                    state_scores[source_row, position] * old_scale,
+                )
+
+        neighbor_scale = (1.0 - alpha) / new_norm
+        terminal_score = neighbor_scale * alpha
+        for edge_position in range(edge_start, edge_end):
+            neighbor_row = neighbor_rows[edge_position]
+            _insert_temporal_candidate(
+                hash_nodes,
+                hash_times,
+                hash_scores,
+                all_nodes[neighbor_row],
+                snapshot_time,
+                terminal_score,
+            )
+
+        for edge_position in range(edge_start, edge_end):
+            neighbor_row = neighbor_rows[edge_position]
+            for position in range(state_lengths[neighbor_row]):
+                _insert_temporal_candidate(
+                    hash_nodes,
+                    hash_times,
+                    hash_scores,
+                    state_nodes[neighbor_row, position],
+                    state_times[neighbor_row, position],
+                    state_scores[neighbor_row, position] * neighbor_scale,
+                )
+
+        ranked_length = 0
+        for slot in range(hash_capacity):
+            candidate_time = hash_times[slot]
+            candidate_score = hash_scores[slot]
+            if candidate_time < 0 or candidate_score <= min_score:
+                continue
+            candidate_node = hash_nodes[slot]
+            insert_at = ranked_length
+            if insert_at > width:
+                insert_at = width
+            while insert_at > 0 and _is_better_candidate(
+                candidate_score,
+                candidate_time,
+                candidate_node,
+                output_scores[source_position, insert_at - 1],
+                output_times[source_position, insert_at - 1],
+                output_nodes[source_position, insert_at - 1],
+            ):
+                insert_at -= 1
+            if insert_at >= width:
+                continue
+
+            move_from = ranked_length
+            if move_from >= width:
+                move_from = width - 1
+            while move_from > insert_at:
+                output_nodes[source_position, move_from] = output_nodes[
+                    source_position, move_from - 1
+                ]
+                output_times[source_position, move_from] = output_times[
+                    source_position, move_from - 1
+                ]
+                output_scores[source_position, move_from] = output_scores[
+                    source_position, move_from - 1
+                ]
+                move_from -= 1
+            output_nodes[source_position, insert_at] = candidate_node
+            output_times[source_position, insert_at] = candidate_time
+            output_scores[source_position, insert_at] = candidate_score
+            if ranked_length < width:
+                ranked_length += 1
+        output_lengths[source_position] = ranked_length
+
+
 class TemporalPPRStreamingIndex:
     """Maintain approximate T-PPR state while advancing through snapshots."""
 
-    def __init__(self, temporal_ppr, top_l=20, internal_top_k=80,
+    def __init__(self, temporal_ppr, top_l=20, internal_top_k=20,
                  min_score=0.0):
         if not isinstance(top_l, int) or top_l <= 0:
             raise ValueError("top_l must be a positive integer")
@@ -46,8 +203,89 @@ class TemporalPPRStreamingIndex:
         self.internal_top_k = internal_top_k
         self.min_score = float(min_score)
         self.current_time = -1
-        self._norms = {}
-        self._states = {}
+        self._nodes = np.asarray(
+            sorted(int(node) for node in temporal_ppr._history),
+            dtype=np.int64,
+        )
+        shape = (len(self._nodes), self.internal_top_k)
+        self._state_nodes = np.zeros(shape, dtype=np.int64)
+        self._state_times = np.full(shape, -1, dtype=np.int32)
+        self._state_scores = np.zeros(shape, dtype=np.float64)
+        self._state_lengths = np.zeros(len(self._nodes), dtype=np.int32)
+        self._norms = np.zeros(len(self._nodes), dtype=np.float64)
+
+    def _rows_for_nodes(self, nodes):
+        """Map graph node IDs to rows in the fixed-width state arrays."""
+        nodes = np.asarray(nodes, dtype=np.int64)
+        if not len(nodes):
+            return np.empty(0, dtype=np.int64)
+        rows = np.searchsorted(self._nodes, nodes)
+        if np.any(rows >= len(self._nodes)):
+            raise KeyError("T-PPR node is missing from the static node index")
+        if not np.array_equal(self._nodes[rows], nodes):
+            raise KeyError("T-PPR node is missing from the static node index")
+        return rows
+
+    def _advance_snapshot(self, snapshot_time):
+        adjacency = self.temporal_ppr._snapshot_adjacency[snapshot_time]
+        if not adjacency:
+            return
+
+        active_nodes = np.asarray(sorted(adjacency), dtype=np.int64)
+        active_rows = self._rows_for_nodes(active_nodes)
+        degrees = np.fromiter(
+            (len(adjacency[int(node)]) for node in active_nodes),
+            dtype=np.int64,
+            count=len(active_nodes),
+        )
+        adjacency_offsets = np.empty(len(active_nodes) + 1, dtype=np.int64)
+        adjacency_offsets[0] = 0
+        np.cumsum(degrees, out=adjacency_offsets[1:])
+        neighbor_nodes = np.fromiter(
+            (
+                neighbor
+                for node in active_nodes
+                for neighbor in adjacency[int(node)]
+            ),
+            dtype=np.int64,
+            count=int(degrees.sum()),
+        )
+        neighbor_rows = self._rows_for_nodes(neighbor_nodes)
+        output_shape = (len(active_rows), self.internal_top_k)
+        output_nodes = np.zeros(output_shape, dtype=np.int64)
+        output_times = np.full(output_shape, -1, dtype=np.int32)
+        output_scores = np.zeros(output_shape, dtype=np.float64)
+        output_lengths = np.zeros(len(active_rows), dtype=np.int32)
+        output_norms = np.zeros(len(active_rows), dtype=np.float64)
+
+        # The kernel reads only the preceding global state. Each worker writes
+        # one private output row, so same-snapshot updates cannot leak between
+        # neighboring sources.
+        _update_source_rows(
+            active_rows,
+            adjacency_offsets,
+            neighbor_rows,
+            self._nodes,
+            self._state_nodes,
+            self._state_times,
+            self._state_scores,
+            self._state_lengths,
+            self._norms,
+            snapshot_time,
+            self.temporal_ppr.alpha,
+            self.temporal_ppr.beta,
+            self.min_score,
+            output_nodes,
+            output_times,
+            output_scores,
+            output_lengths,
+            output_norms,
+        )
+        self._state_nodes[active_rows] = output_nodes
+        self._state_times[active_rows] = output_times
+        self._state_scores[active_rows] = output_scores
+        self._state_lengths[active_rows] = output_lengths
+        self._norms[active_rows] = output_norms
 
     def advance_to(self, time):
         """Advance the index to ``time`` without reading future snapshots."""
@@ -65,39 +303,7 @@ class TemporalPPRStreamingIndex:
             )
 
         for snapshot_time in range(self.current_time + 1, time + 1):
-            adjacency = self.temporal_ppr._snapshot_adjacency[snapshot_time]
-            updates = {}
-            norm_updates = {}
-
-            # All right-hand sides read the state from the preceding snapshot.
-            for node, neighbors in adjacency.items():
-                degree = len(neighbors)
-                decay = self.temporal_ppr.beta
-                old_norm = self._norms.get(node, 0.0)
-                new_norm = decay * old_norm + degree
-                candidates = defaultdict(float)
-
-                if old_norm > 0.0:
-                    old_scale = decay * old_norm / new_norm
-                    for key, score in self._states.get(node, {}).items():
-                        candidates[key] += old_scale * score
-
-                neighbor_scale = (1.0 - self.temporal_ppr.alpha) / new_norm
-                terminal_score = neighbor_scale * self.temporal_ppr.alpha
-                for neighbor in neighbors:
-                    candidates[(neighbor, snapshot_time)] += terminal_score
-                    for key, score in self._states.get(neighbor, {}).items():
-                        candidates[key] += neighbor_scale * score
-
-                updates[node] = dict(self.temporal_ppr._rank_scores(
-                    candidates,
-                    self.internal_top_k,
-                    min_score=self.min_score,
-                ))
-                norm_updates[node] = new_norm
-
-            self._states.update(updates)
-            self._norms.update(norm_updates)
+            self._advance_snapshot(snapshot_time)
             self.current_time = snapshot_time
         return self
 
@@ -105,23 +311,26 @@ class TemporalPPRStreamingIndex:
         """Return the configured Top-L influences at the current time."""
         if self.current_time < 0:
             raise RuntimeError("advance_to must be called before querying")
-        ranked = self.temporal_ppr._rank_scores(
-            self._states.get(node, {}),
-            self.top_l,
-            min_score=self.min_score,
-        )
-        selected_total = sum(score for _, score in ranked)
+        node = int(node)
+        row = int(np.searchsorted(self._nodes, node))
+        if row >= len(self._nodes) or self._nodes[row] != node:
+            return ()
+        length = min(int(self._state_lengths[row]), self.top_l)
+        if not length:
+            return ()
+        scores = self._state_scores[row, :length]
+        selected_total = float(scores.sum())
         if selected_total == 0.0:
-            return []
-        return [
+            return ()
+        return tuple(
             TemporalInfluence(
-                node=target_node,
-                time=target_time,
-                score=score,
-                weight=score / selected_total,
+                node=int(self._state_nodes[row, position]),
+                time=int(self._state_times[row, position]),
+                score=float(scores[position]),
+                weight=float(scores[position] / selected_total),
             )
-            for (target_node, target_time), score in ranked
-        ]
+            for position in range(length)
+        )
 
 
 class TemporalPPR:
@@ -293,7 +502,7 @@ class TemporalPPR:
         self,
         queries_by_time,
         top_l=20,
-        internal_top_k=80,
+        internal_top_k=20,
         min_score=0.0,
     ):
         """Yield top-L answers while scanning snapshots exactly once.
@@ -349,7 +558,7 @@ class TemporalPPR:
             for node in normalized_queries.get(time, ()):
                 yield node, time, index.top_neighbors(node)
 
-    def streaming_index(self, top_l=20, internal_top_k=80, min_score=0.0):
+    def streaming_index(self, top_l=20, internal_top_k=20, min_score=0.0):
         """Return a reusable causal index that can advance through time."""
         return TemporalPPRStreamingIndex(
             self,
