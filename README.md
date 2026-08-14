@@ -129,8 +129,8 @@ examined nodes and new model predictions.
 Snapshots, test samples, and persisted evaluation sets are cached inside the
 specific `time_slices/step_<step>_window_<window>/` directory that produced them.
 
-The completed MOOC comparison between Hybrid and Zebra is documented in
-[`docs/mooc-community-evaluation-results.md`](docs/mooc-community-evaluation-results.md).
+The Hybrid and Zebra comparison on MOOC and WikiTalk is documented in
+[`docs/community-evaluation-results.md`](docs/community-evaluation-results.md).
 
 ## Data Format
 
