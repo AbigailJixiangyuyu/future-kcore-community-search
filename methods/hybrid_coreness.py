@@ -6,6 +6,130 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
+
+
+def cumulative_ordinal_targets(labels, kmax):
+    """Encode integer coreness labels as ``coreness >= k`` targets."""
+    if labels.dim() != 1:
+        raise ValueError("labels must be a 1D tensor")
+    if kmax <= 0:
+        raise ValueError("kmax must be positive")
+    if torch.any(labels < 0) or torch.any(labels > kmax):
+        raise ValueError("labels must be in [0, kmax]")
+    thresholds = torch.arange(1, kmax + 1, device=labels.device)
+    return (labels.unsqueeze(1) >= thresholds.unsqueeze(0)).to(torch.float32)
+
+
+def cumulative_logits_from_class_logits(class_logits):
+    """Return stable logits for ``P(coreness >= k)`` from class logits."""
+    if class_logits.dim() != 2 or class_logits.size(1) < 2:
+        raise ValueError("class_logits must have shape [batch, class_count >= 2]")
+    return torch.stack(
+        [
+            torch.logsumexp(class_logits[:, threshold:], dim=1)
+            - torch.logsumexp(class_logits[:, :threshold], dim=1)
+            for threshold in range(1, class_logits.size(1))
+        ],
+        dim=1,
+    )
+
+
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, width, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.transform = nn.Sequential(
+            nn.Linear(width, width * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(width * 2, width),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, values):
+        return values + self.transform(self.norm(values))
+
+
+class MaskedSetAttentionBlock(nn.Module):
+    """Permutation-equivariant self-attention for padded temporal-node sets."""
+
+    def __init__(self, width, heads, dropout):
+        super().__init__()
+        if width % heads:
+            raise ValueError("attention width must be divisible by heads")
+        self.heads = int(heads)
+        self.head_width = width // heads
+        self.qkv = nn.Linear(width, width * 3)
+        self.output = nn.Linear(width, width)
+        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(width)
+        self.ffn = ResidualMLPBlock(width, dropout)
+
+    def forward(self, values, mask):
+        batch, length, width = values.shape
+        qkv = self.qkv(values).view(
+            batch, length, 3, self.heads, self.head_width
+        )
+        query, key, value = [
+            part.permute(0, 2, 1, 3) for part in qkv.unbind(dim=2)
+        ]
+        scores = torch.matmul(query, key.transpose(-2, -1))
+        scores = scores / self.head_width ** 0.5
+        scores = scores.masked_fill(~mask[:, None, None, :], -1e4)
+        attention = torch.softmax(scores, dim=-1)
+        attention = attention * mask[:, None, None, :].to(attention.dtype)
+        attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        attended = torch.matmul(self.dropout(attention), value)
+        attended = attended.permute(0, 2, 1, 3).reshape(batch, length, width)
+        result = self.norm1(values + self.dropout(self.output(attended)))
+        result = self.ffn(result)
+        return result * mask.unsqueeze(-1).to(result.dtype)
+
+
+class QuerySetAttention(nn.Module):
+    """Pool a temporal-node set using the query and T-PPR weights."""
+
+    def __init__(self, width, heads, dropout):
+        super().__init__()
+        if width % heads:
+            raise ValueError("attention width must be divisible by heads")
+        self.heads = int(heads)
+        self.head_width = width // heads
+        self.query = nn.Linear(width, width)
+        self.key = nn.Linear(width, width)
+        self.value = nn.Linear(width, width)
+        self.output = nn.Linear(width, width)
+        self.dropout = nn.Dropout(dropout)
+        self.prior_strength_raw = nn.Parameter(
+            torch.tensor(0.541324854612918, dtype=torch.float32)
+        )
+
+    def forward(self, query, values, weights, mask):
+        batch, length, width = values.shape
+        projected_query = self.query(query).view(
+            batch, self.heads, self.head_width
+        )
+        projected_key = self.key(values).view(
+            batch, length, self.heads, self.head_width
+        ).permute(0, 2, 1, 3)
+        projected_value = self.value(values).view(
+            batch, length, self.heads, self.head_width
+        ).permute(0, 2, 1, 3)
+        scores = torch.sum(projected_query.unsqueeze(2) * projected_key, dim=-1)
+        scores = scores / self.head_width ** 0.5
+        prior_strength = F.softplus(self.prior_strength_raw)
+        scores = scores + prior_strength * torch.log(
+            weights.clamp_min(1e-12)
+        ).unsqueeze(1)
+        scores = scores.masked_fill(~mask.unsqueeze(1), -1e4)
+        attention = torch.softmax(scores, dim=-1)
+        attention = attention * mask.unsqueeze(1).to(attention.dtype)
+        attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        pooled = torch.sum(
+            self.dropout(attention).unsqueeze(-1) * projected_value, dim=2
+        )
+        return self.output(pooled.reshape(batch, width))
 
 
 class HybridCorenessPredictor(nn.Module):
@@ -20,6 +144,11 @@ class HybridCorenessPredictor(nn.Module):
         structure_hidden=64,
         temporal_hidden=64,
         fusion_hidden=128,
+        core_dim=32,
+        core_lookback=5,
+        bucket_dim=16,
+        attention_heads=4,
+        persistence_scale=2.0,
         dropout=0.2,
     ):
         super().__init__()
@@ -31,45 +160,101 @@ class HybridCorenessPredictor(nn.Module):
             raise ValueError("hmax must be non-negative")
         if not 1 <= order <= 4:
             raise ValueError("order must be in [1, 4]")
+        if core_dim <= 0 or core_lookback <= 0 or bucket_dim <= 0:
+            raise ValueError("embedding dimensions and lookback must be positive")
+        if structure_hidden % attention_heads:
+            raise ValueError("structure_hidden must be divisible by attention_heads")
+        if persistence_scale <= 0:
+            raise ValueError("persistence_scale must be positive")
 
         self.kmax = int(kmax)
         self.hmax = int(hmax)
         self.order = int(order)
+        self.core_dim = int(core_dim)
+        self.core_lookback = int(core_lookback)
         self.structure_width = order * (hmax + 1)
+        self.coreness_table = nn.Parameter(
+            torch.empty(kmax + 2, core_dim).normal_(mean=0.0, std=0.02)
+        )
+        self.lag_table = nn.Parameter(
+            torch.empty(core_lookback, core_dim).normal_(mean=0.0, std=0.02)
+        )
+        self.h_index_bucket_table = nn.Parameter(
+            torch.empty(hmax + 1, bucket_dim).normal_(mean=0.0, std=0.02)
+        )
+        self.coreness_bucket_table = nn.Parameter(
+            torch.empty(hmax + 1, bucket_dim).normal_(mean=0.0, std=0.02)
+        )
+        self.structure_order_table = nn.Parameter(
+            torch.empty(order, bucket_dim).normal_(mean=0.0, std=0.02)
+        )
 
         self.time_encoder = nn.Sequential(
             nn.Linear(1, time_dim),
-            nn.ReLU(),
+            nn.GELU(),
         )
-        self.structure_transform = nn.Sequential(
-            nn.Linear(self.structure_width + time_dim, structure_hidden),
-            nn.ReLU(),
+        self.structure_token_encoder = nn.Sequential(
+            nn.Linear(order * bucket_dim + time_dim + 1, structure_hidden),
+            nn.GELU(),
             nn.Dropout(dropout),
         )
         self.temporal_encoder = nn.Sequential(
             nn.LayerNorm(kmax),
             nn.Linear(kmax, temporal_hidden),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.predictor = nn.Sequential(
-            nn.Linear(temporal_hidden + structure_hidden, fusion_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_hidden, kmax + 1),
+        self.history_encoder = nn.GRU(
+            core_dim, temporal_hidden, batch_first=True
         )
+        self.query_projection = nn.Sequential(
+            nn.Linear(core_dim + 2 * temporal_hidden, structure_hidden),
+            nn.GELU(),
+        )
+        self.query_blocks = nn.ModuleList(
+            [ResidualMLPBlock(structure_hidden, dropout) for _ in range(2)]
+        )
+        self.set_attention = MaskedSetAttentionBlock(
+            structure_hidden, attention_heads, dropout
+        )
+        self.query_attention = QuerySetAttention(
+            structure_hidden, attention_heads, dropout
+        )
+        self.structure_norm = nn.LayerNorm(structure_hidden)
+        self.fusion_projection = nn.Sequential(
+            nn.Linear(structure_hidden * 4, fusion_hidden),
+            nn.GELU(),
+        )
+        self.fusion_blocks = nn.ModuleList(
+            [ResidualMLPBlock(fusion_hidden, dropout) for _ in range(2)]
+        )
+        self.core_projection = nn.Linear(fusion_hidden, core_dim)
+        self.output_bias = nn.Parameter(torch.zeros(kmax + 1))
+        nn.init.zeros_(self.core_projection.weight)
+        nn.init.zeros_(self.core_projection.bias)
+
+        levels = torch.arange(kmax + 1, dtype=torch.float32)
+        persistence_logits = -float(persistence_scale) * torch.abs(
+            levels[:, None] - levels[None, :]
+        )
+        self.register_buffer("persistence_logits", persistence_logits)
 
     def forward(
         self,
         temporal,
+        core_history,
         neighbor_structures,
         time_deltas,
         weights,
         mask,
     ):
-        """Return logits for coreness classes ``0..kmax``."""
+        """Return tied-embedding logits for coreness classes ``0..kmax``."""
         if temporal.dim() != 2 or temporal.size(1) != self.kmax:
             raise ValueError("temporal input has an invalid shape")
+        if core_history.dim() != 2 or core_history.size(1) != self.core_lookback:
+            raise ValueError("core_history has an invalid shape")
+        if torch.any(core_history < 0) or torch.any(core_history > self.kmax + 1):
+            raise ValueError("core_history contains an invalid token")
         if neighbor_structures.dim() != 3:
             raise ValueError("neighbor_structures must be a 3D tensor")
         if neighbor_structures.size(2) != self.structure_width:
@@ -82,9 +267,23 @@ class HybridCorenessPredictor(nn.Module):
         encoded_time = self.time_encoder(
             torch.log1p(time_deltas.clamp_min(0.0)).unsqueeze(-1)
         )
-        transformed = self.structure_transform(
-            torch.cat((neighbor_structures, encoded_time), dim=-1)
+        histograms = neighbor_structures.view(
+            *neighbor_structures.shape[:2], self.order, self.hmax + 1
         )
+        structure_blocks = []
+        for level in range(self.order):
+            table = (
+                self.coreness_bucket_table
+                if level == self.order - 1
+                else self.h_index_bucket_table
+            )
+            embedded = torch.matmul(histograms[:, :, level], table)
+            structure_blocks.append(embedded + self.structure_order_table[level])
+        log_weights = torch.log(weights.clamp_min(1e-12)).unsqueeze(-1)
+        tokens = self.structure_token_encoder(
+            torch.cat((*structure_blocks, encoded_time, log_weights), dim=-1)
+        )
+        tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
 
         effective_weights = weights * mask.to(weights.dtype)
         weight_sum = effective_weights.sum(dim=1, keepdim=True)
@@ -93,21 +292,61 @@ class HybridCorenessPredictor(nn.Module):
             effective_weights / weight_sum.clamp_min(1e-12),
             torch.zeros_like(effective_weights),
         )
-        structural = torch.sum(
-            normalized_weights.unsqueeze(-1) * transformed,
-            dim=1,
+        prior = torch.sum(normalized_weights.unsqueeze(-1) * tokens, dim=1)
+
+        history_tokens = self.coreness_table[core_history] + self.lag_table
+        _history_output, history_state = self.history_encoder(
+            torch.flip(history_tokens, dims=(1,))
         )
         temporal_state = self.temporal_encoder(temporal)
-        return self.predictor(torch.cat((temporal_state, structural), dim=1))
+        current_token = core_history[:, 0]
+        current_embedding = self.coreness_table[current_token]
+        query = self.query_projection(
+            torch.cat((current_embedding, history_state[-1], temporal_state), dim=1)
+        )
+        for block in self.query_blocks:
+            query = block(query)
+
+        set_tokens = self.set_attention(tokens, mask)
+        learned_pool = self.query_attention(query, set_tokens, weights, mask)
+        structural = self.structure_norm(prior + learned_pool)
+        fused = self.fusion_projection(
+            torch.cat(
+                (query, structural, query * structural, torch.abs(query - structural)),
+                dim=1,
+            )
+        )
+        for block in self.fusion_blocks:
+            fused = block(fused)
+
+        core_state = self.core_projection(fused)
+        learned_logits = torch.matmul(
+            core_state, self.coreness_table[:self.kmax + 1].transpose(0, 1)
+        ) + self.output_bias
+        persistence_core = torch.where(
+            current_token <= self.kmax,
+            current_token,
+            torch.zeros_like(current_token),
+        )
+        return self.persistence_logits[persistence_core] + learned_logits
+
+    @staticmethod
+    def ordinal_logits(class_logits):
+        return cumulative_logits_from_class_logits(class_logits)
 
     def predict_coreness(self, *inputs):
-        """Return the most likely integer coreness for each input sample."""
-        return self(*inputs).argmax(dim=1)
+        """Decode coreness as the number of passed ordinal thresholds."""
+        return (self.ordinal_logits(self(*inputs)) > 0.0).sum(dim=1)
 
 
 def load_hybrid_coreness_model(checkpoint_path, device="cpu"):
     """Load a model checkpoint written by ``train_coreness.py``."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    objective = checkpoint.get("objective", {})
+    if objective.get("name") != "token_tied_cumulative_ordinal_bce":
+        raise ValueError(
+            "checkpoint does not use the token-tied ordinal model; retrain it"
+        )
     model = HybridCorenessPredictor(**checkpoint["model_config"])
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
@@ -132,6 +371,7 @@ def predict_coreness_map(model, feature_arrays, batch_size=512, device=None):
                 torch.from_numpy(feature_arrays[name][start:end]).to(device)
                 for name in (
                     "temporal",
+                    "core_history",
                     "neighbor_structures",
                     "time_deltas",
                     "weights",
@@ -199,6 +439,9 @@ def predict_coreness_indexed_map(
             )
             inputs = [
                 torch.from_numpy(feature_table["temporal"][batch_rows]).to(device),
+                torch.from_numpy(
+                    feature_table["core_history"][batch_rows]
+                ).to(device),
                 torch.from_numpy(
                     np.asarray(structure_values[structure_indices])
                 ).to(device),

@@ -32,9 +32,6 @@ from methods.tcs_representation import TCSStreamingIndex
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SLICES = ROOT / "data/mooc/time_slices/step_43200_window_86400"
-DEFAULT_CHECKPOINT = (
-    DEFAULT_SLICES / "model_cache/hybrid_coreness_v5_h64.pt"
-)
 DEFAULT_BATCH_SIZE = 512
 EVALUATION_KS = (3, 4, 5, 6, 7)
 STATE_CACHE_VERSION = 1
@@ -379,6 +376,7 @@ class HybridCommunityPredictor:
             t_ppr_index=self.t_ppr_index,
             tcs_index=self.tcs_index,
             order=self.model.order,
+            core_lookback=self.model.core_lookback,
         )
         feature_materialize_s = time.time() - feature_started
         self._context = HybridTimeContext(
@@ -439,6 +437,12 @@ def _resolve_device(device_name):
     return device_name
 
 
+def _resolve_checkpoint_path(slices_dir, checkpoint):
+    if checkpoint is not None:
+        return Path(checkpoint)
+    return Path(slices_dir) / "model_cache" / "hybrid_coreness.pt"
+
+
 def _state_cache_identity(slices_dir):
     """Fingerprint the immutable inputs that define a streaming state."""
     slices_dir = Path(slices_dir)
@@ -456,8 +460,9 @@ def _build_predictor(args):
     slices_dir = Path(args.slices_dir)
     snapshots, total_nodes, kmax, hmax = build_snapshots(slices_dir)
     device = _resolve_device(args.device)
+    checkpoint_path = _resolve_checkpoint_path(slices_dir, args.checkpoint)
     model, checkpoint = load_hybrid_coreness_model(
-        args.checkpoint, device=device
+        checkpoint_path, device=device
     )
     if model.kmax != kmax:
         raise ValueError(
@@ -643,7 +648,9 @@ def _evaluate(args):
             ]))
     payload = {
         "dataset": dataset_name,
-        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "checkpoint": str(
+            _resolve_checkpoint_path(args.slices_dir, args.checkpoint).resolve()
+        ),
         "start_t": start_t,
         "samples": len(samples),
         "examined_node_count": total_examined_nodes,
@@ -669,7 +676,11 @@ def _evaluate(args):
 
 def _add_common_arguments(parser):
     parser.add_argument("--slices-dir", default=str(DEFAULT_SLICES))
-    parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="defaults to <slices-dir>/model_cache/hybrid_coreness.pt",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--batch-size", type=int, default=DEFAULT_BATCH_SIZE

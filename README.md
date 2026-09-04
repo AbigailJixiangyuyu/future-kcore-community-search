@@ -97,9 +97,14 @@ as a full per-query reference implementation.
 
 `train_coreness.py` builds causal `(u, t) -> coreness(u, t+1)` samples with a
 70/15/15 chronological split and trains `HybridCorenessPredictor`. The model
-applies a trainable time encoder and shared structural transformation before
-T-PPR weighted aggregation, fuses the result with TCS, and predicts one of the
-fixed classes `0..kmax`. Feature tensors and the final checkpoint are cached
+encodes the five most recent coreness values with a trainable token table and
+GRU. The same table is tied to the output decoder. Bucket embeddings and set
+attention encode the Top-L structural histories, while the fixed T-PPR weighted
+pool remains a residual prior. Residual fusion predicts a correction to the
+current-coreness persistence baseline. Class logits are converted to monotone
+cumulative probabilities and trained with one mildly reweighted ordinal binary
+cross-entropy objective; coreness is decoded as the number of passed thresholds.
+Feature tensors and the final checkpoint are cached
 inside the selected time-slice directory's `model_cache/`. When a per-time
 sample limit is used, nodes are stratified by their observable current
 coreness, including a group for historically seen but currently absent nodes;

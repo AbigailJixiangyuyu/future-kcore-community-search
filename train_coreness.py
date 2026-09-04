@@ -14,11 +14,15 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from datasets.coreness_prediction_builder import (
+    add_core_history_tokens,
     build_coreness_samples,
     prepare_feature_arrays_by_split,
 )
 from datasets.dataset_builder import build_snapshots
-from methods.hybrid_coreness import HybridCorenessPredictor
+from methods.hybrid_coreness import (
+    HybridCorenessPredictor,
+    cumulative_ordinal_targets,
+)
 from methods.t_ppr import TemporalPPR
 
 
@@ -36,6 +40,7 @@ def _set_seed(seed):
 def _tensor_dataset(arrays):
     return TensorDataset(
         torch.from_numpy(arrays["temporal"]),
+        torch.from_numpy(arrays["core_history"]),
         torch.from_numpy(arrays["structure_indices"]),
         torch.from_numpy(arrays["time_deltas"]),
         torch.from_numpy(arrays["weights"]),
@@ -46,12 +51,21 @@ def _tensor_dataset(arrays):
 
 def _model_batch(batch, structure_table, device):
     """Gather one batch's shared structure rows and move inputs to device."""
-    temporal, structure_indices, time_deltas, weights, mask, target = batch
+    (
+        temporal,
+        core_history,
+        structure_indices,
+        time_deltas,
+        weights,
+        mask,
+        target,
+    ) = batch
     neighbor_structures = torch.from_numpy(
         np.asarray(structure_table[structure_indices.numpy()])
     )
     features = [
         temporal.to(device),
+        core_history.to(device),
         neighbor_structures.to(device),
         time_deltas.to(device),
         weights.to(device),
@@ -98,6 +112,12 @@ def _load_or_prepare_features(
                 arrays[split] = {
                     name: cached[name] for name in cached.files
                 }
+            add_core_history_tokens(
+                arrays[split],
+                snapshots,
+                kmax,
+                lookback=config["core_lookback"],
+            )
         print(f"[features] Loading structures: {structure_cache_path}")
         structure_table = np.load(
             str(structure_cache_path), mmap_mode="r", allow_pickle=False
@@ -135,6 +155,13 @@ def _load_or_prepare_features(
         progress=report,
         structure_table_path=structure_cache_path,
     )
+    for split_arrays in arrays.values():
+        add_core_history_tokens(
+            split_arrays,
+            snapshots,
+            kmax,
+            lookback=config["core_lookback"],
+        )
     for split, split_arrays in arrays.items():
         cache_path = cache_paths[split]
         np.savez_compressed(str(cache_path), **split_arrays)
@@ -149,16 +176,6 @@ def _load_or_prepare_features(
             str(structure_cache_path), mmap_mode="r", allow_pickle=False
         )
     return arrays, structure_table
-
-
-def _class_weights(labels, class_count):
-    counts = np.bincount(labels, minlength=class_count).astype(np.float64)
-    weights = np.zeros(class_count, dtype=np.float32)
-    present = counts > 0
-    weights[present] = counts[present].sum() / (
-        present.sum() * counts[present]
-    )
-    return torch.from_numpy(weights)
 
 
 def _binary_metrics(prediction, truth):
@@ -179,6 +196,24 @@ def _binary_metrics(prediction, truth):
     }
 
 
+def _ordinal_positive_weights(labels, kmax, power=0.5, cap=10.0):
+    """Return capped positive weights for cumulative threshold targets."""
+    if not 0.0 <= power <= 1.0:
+        raise ValueError("ordinal weight power must be in [0, 1]")
+    if cap < 1.0:
+        raise ValueError("ordinal weight cap must be at least 1")
+    labels = np.asarray(labels, dtype=np.int64)
+    thresholds = np.arange(1, kmax + 1, dtype=np.int64)
+    positives = np.sum(labels[:, None] >= thresholds[None, :], axis=0)
+    negatives = len(labels) - positives
+    weights = np.ones(kmax, dtype=np.float32)
+    valid = (positives > 0) & (negatives > positives)
+    weights[valid] = np.minimum(
+        np.power(negatives[valid] / positives[valid], power), cap
+    ).astype(np.float32)
+    return torch.from_numpy(weights)
+
+
 def evaluate_model(model, loader, structure_table, criterion, device, kmax):
     model.eval()
     total_loss = 0.0
@@ -187,9 +222,15 @@ def evaluate_model(model, loader, structure_table, criterion, device, kmax):
     with torch.no_grad():
         for batch in loader:
             features, target = _model_batch(batch, structure_table, device)
-            logits = model(*features)
-            total_loss += criterion(logits, target).item() * target.size(0)
-            predictions.append(logits.argmax(dim=1).cpu().numpy())
+            class_logits = model(*features)
+            ordinal_logits = model.ordinal_logits(class_logits)
+            ordinal_target = cumulative_ordinal_targets(target, kmax)
+            total_loss += (
+                criterion(ordinal_logits, ordinal_target).item() * target.size(0)
+            )
+            predictions.append(
+                (ordinal_logits > 0.0).sum(dim=1).cpu().numpy()
+            )
             labels.append(target.cpu().numpy())
 
     if not labels:
@@ -253,6 +294,7 @@ def train(args):
         "t_ppr_alpha": args.t_ppr_alpha,
         "t_ppr_beta": args.t_ppr_beta,
         "min_probability": args.min_probability,
+        "core_lookback": args.core_lookback,
         "max_nodes_per_time": args.max_nodes_per_time,
         "train_ratio": args.train_ratio,
         "val_ratio": args.val_ratio,
@@ -297,11 +339,25 @@ def train(args):
         "structure_hidden": args.structure_hidden,
         "temporal_hidden": args.temporal_hidden,
         "fusion_hidden": args.fusion_hidden,
+        "core_dim": args.core_dim,
+        "core_lookback": args.core_lookback,
+        "bucket_dim": args.bucket_dim,
+        "attention_heads": args.attention_heads,
+        "persistence_scale": args.persistence_scale,
         "dropout": args.dropout,
     }
     model = HybridCorenessPredictor(**model_config).to(device)
-    weights = _class_weights(arrays["train"]["labels"], kmax + 1).to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    positive_weights = _ordinal_positive_weights(
+        arrays["train"]["labels"],
+        kmax,
+        power=args.ordinal_weight_power,
+        cap=args.ordinal_weight_cap,
+    ).to(device)
+    print(
+        "[train] ordinal_pos_weights="
+        + ",".join(f"{value:.4f}" for value in positive_weights.tolist())
+    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=positive_weights)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -316,8 +372,10 @@ def train(args):
         for batch in loaders["train"]:
             features, target = _model_batch(batch, structure_table, device)
             optimizer.zero_grad()
-            logits = model(*features)
-            loss = criterion(logits, target)
+            class_logits = model(*features)
+            ordinal_logits = model.ordinal_logits(class_logits)
+            ordinal_target = cumulative_ordinal_targets(target, kmax)
+            loss = criterion(ordinal_logits, ordinal_target)
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * target.size(0)
@@ -359,6 +417,15 @@ def train(args):
         "state_dict": {key: value.cpu() for key, value in model.state_dict().items()},
         "model_config": model_config,
         "feature_config": feature_config,
+        "objective": {
+            "name": "token_tied_cumulative_ordinal_bce",
+            "thresholds": list(range(1, kmax + 1)),
+            "decision_logit": 0.0,
+            "monotone": True,
+            "positive_weights": positive_weights.cpu().tolist(),
+            "positive_weight_power": args.ordinal_weight_power,
+            "positive_weight_cap": args.ordinal_weight_cap,
+        },
         "split_config": {
             "train_ratio": args.train_ratio,
             "val_ratio": args.val_ratio,
@@ -368,7 +435,14 @@ def train(args):
     torch.save(checkpoint, str(output_path))
     metrics_path = output_path.with_suffix(".json")
     metrics_path.write_text(
-        json.dumps(checkpoint["metrics"], indent=2, sort_keys=True) + "\n"
+        json.dumps(
+            {
+                "objective": checkpoint["objective"],
+                **checkpoint["metrics"],
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n"
     )
     print(f"[train] Saved model to {output_path}")
     return model, checkpoint
@@ -396,6 +470,13 @@ def build_parser():
     parser.add_argument("--structure-hidden", type=int, default=64)
     parser.add_argument("--temporal-hidden", type=int, default=64)
     parser.add_argument("--fusion-hidden", type=int, default=128)
+    parser.add_argument("--core-dim", type=int, default=32)
+    parser.add_argument("--core-lookback", type=int, default=5)
+    parser.add_argument("--bucket-dim", type=int, default=16)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--persistence-scale", type=float, default=2.0)
+    parser.add_argument("--ordinal-weight-power", type=float, default=0.5)
+    parser.add_argument("--ordinal-weight-cap", type=float, default=10.0)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")

@@ -10,6 +10,9 @@ from methods.t_ppr import TemporalPPR
 from methods.tcs_representation import TCSStreamingIndex, tcs_representation
 
 
+DEFAULT_CORE_HISTORY = 5
+
+
 @dataclass(frozen=True)
 class CorenessSample:
     """Predict one node's coreness in the snapshot after ``time``."""
@@ -210,9 +213,48 @@ def build_prediction_samples(snapshots, t):
     ]
 
 
-def _empty_feature_arrays(sample_count, kmax, top_l, structure_width):
+def add_core_history_tokens(
+    arrays, snapshots, kmax, lookback=DEFAULT_CORE_HISTORY
+):
+    """Attach recent coreness token IDs to sample feature arrays in place."""
+    if lookback <= 0:
+        raise ValueError("lookback must be positive")
+    nodes = arrays.get("nodes")
+    times = arrays.get("times")
+    if nodes is None or times is None or len(nodes) != len(times):
+        raise ValueError("arrays must contain aligned nodes and times")
+    expected_shape = (len(nodes), lookback)
+    existing = arrays.get("core_history")
+    if existing is not None and existing.shape == expected_shape:
+        return arrays
+
+    absent_token = kmax + 1
+    history = np.full(expected_shape, absent_token, dtype=np.int64)
+    for row, (node_value, time_value) in enumerate(zip(nodes, times)):
+        node = int(node_value)
+        time = int(time_value)
+        for lag in range(lookback):
+            snapshot_time = time - lag
+            if snapshot_time < 0:
+                break
+            core_dict = snapshots[snapshot_time]["core_dict"]
+            if node not in core_dict:
+                continue
+            coreness = int(core_dict[node])
+            if coreness < 0 or coreness > kmax:
+                raise ValueError("snapshot coreness is outside [0, kmax]")
+            history[row, lag] = coreness
+    arrays["core_history"] = history
+    return arrays
+
+
+def _empty_feature_arrays(sample_count, kmax, top_l, structure_width,
+                          lookback=DEFAULT_CORE_HISTORY):
     return {
         "temporal": np.zeros((sample_count, kmax), dtype=np.float32),
+        "core_history": np.full(
+            (sample_count, lookback), kmax + 1, dtype=np.int64
+        ),
         "neighbor_structures": np.zeros(
             (sample_count, top_l, structure_width), dtype=np.float32
         ),
@@ -225,9 +267,13 @@ def _empty_feature_arrays(sample_count, kmax, top_l, structure_width):
     }
 
 
-def _empty_indexed_feature_arrays(sample_count, kmax, top_l):
+def _empty_indexed_feature_arrays(sample_count, kmax, top_l,
+                                  lookback=DEFAULT_CORE_HISTORY):
     return {
         "temporal": np.zeros((sample_count, kmax), dtype=np.float32),
+        "core_history": np.full(
+            (sample_count, lookback), kmax + 1, dtype=np.int64
+        ),
         "structure_indices": np.zeros(
             (sample_count, top_l), dtype=np.int32
         ),
@@ -283,6 +329,7 @@ def prepare_feature_arrays_by_split(
             arrays["times"][index] = sample.time
             locations[(sample.node, sample.time)].append((split, index))
             queries_by_time[sample.time].add(sample.node)
+        add_core_history_tokens(arrays, snapshots, kmax)
 
     tcs_index = TCSStreamingIndex(snapshots, kmax=kmax)
     for time in sorted(queries_by_time):
@@ -405,6 +452,7 @@ def prepare_inference_feature_table(
     t_ppr_index,
     tcs_index,
     order=4,
+    core_lookback=DEFAULT_CORE_HISTORY,
 ):
     """Materialize every requested node's indexed model input at one time.
 
@@ -425,9 +473,14 @@ def prepare_inference_feature_table(
 
     nodes = np.asarray(sorted(set(nodes)), dtype=np.int64)
     top_l = t_ppr_index.top_l
-    arrays = _empty_indexed_feature_arrays(len(nodes), kmax, top_l)
+    arrays = _empty_indexed_feature_arrays(
+        len(nodes), kmax, top_l, lookback=core_lookback
+    )
     arrays["nodes"] = nodes
     arrays["times"].fill(t)
+    add_core_history_tokens(
+        arrays, snapshots, kmax, lookback=core_lookback
+    )
     if len(nodes):
         arrays["temporal"][:] = tcs_index.representations(nodes).astype(
             np.float32, copy=False
@@ -463,6 +516,7 @@ def prepare_inference_feature_arrays(
     structure_cache=None,
     tcs_cache=None,
     influence_cache=None,
+    core_lookback=DEFAULT_CORE_HISTORY,
 ):
     """Build model inputs only for the requested nodes at one query time.
 
@@ -486,7 +540,12 @@ def prepare_inference_feature_arrays(
     top_l = t_ppr_index.top_l
     structure_width = order * (hmax + 1)
     arrays = _empty_feature_arrays(
-        len(nodes), kmax, top_l, structure_width
+        len(nodes), kmax, top_l, structure_width, lookback=core_lookback
+    )
+    arrays["nodes"] = nodes
+    arrays["times"].fill(t)
+    add_core_history_tokens(
+        arrays, snapshots, kmax, lookback=core_lookback
     )
     structure_cache = structure_cache if structure_cache is not None else {}
     tcs_cache = tcs_cache if tcs_cache is not None else {}
@@ -505,8 +564,6 @@ def prepare_inference_feature_arrays(
             temporal = temporal.astype(np.float32, copy=False)
             tcs_cache[node] = temporal
         arrays["temporal"][index] = temporal
-        arrays["nodes"][index] = node
-        arrays["times"][index] = t
         influences = influence_cache.get(node)
         if influences is None:
             influences = tuple(t_ppr_index.top_neighbors(node))
