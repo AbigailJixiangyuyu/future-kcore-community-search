@@ -29,11 +29,13 @@ checkpoints/
 outputs/
 runs/
 wandb/
+# Local experiment metrics, logs, and other generated artifacts.
+# Keep curated experiment reports in docs/ under version control.
+/results/
 *.pt
 *.pth
 *.ckpt
 .zebra_cache/
 .zebra_embedding_cache/
-results/*/zebra_work/
 
 run_logs/

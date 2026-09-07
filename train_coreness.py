@@ -322,6 +322,7 @@ def train(args):
             batch_size=args.batch_size,
             shuffle=split == "train",
             num_workers=0,
+            generator=torch.Generator().manual_seed(args.seed),
         )
         for split in arrays
     }
@@ -342,10 +343,6 @@ def train(args):
         "core_dim": args.core_dim,
         "core_lookback": args.core_lookback,
         "bucket_dim": args.bucket_dim,
-        "history_encoder_type": args.history_encoder,
-        "history_attention_heads": args.history_attention_heads,
-        "history_transformer_layers": args.history_transformer_layers,
-        "output_head_type": args.output_head,
         "attention_heads": args.attention_heads,
         "persistence_scale": args.persistence_scale,
         "dropout": args.dropout,
@@ -421,7 +418,10 @@ def train(args):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "state_dict": {key: value.cpu() for key, value in model.state_dict().items()},
-        "model_config": model_config,
+        "model_config": dict(
+            model_config, structure_pooling="b", fusion_type="concat",
+            output_head_type="linear",
+        ),
         "feature_config": feature_config,
         "objective": {
             "name": "hybrid_cumulative_ordinal_bce",
@@ -454,7 +454,7 @@ def train(args):
         json.dumps(
             {
                 "objective": checkpoint["objective"],
-                "model_config": model_config,
+                "model_config": checkpoint["model_config"],
                 "training_config": checkpoint["training_config"],
                 **checkpoint["metrics"],
             },
@@ -490,16 +490,6 @@ def build_parser():
     parser.add_argument("--fusion-hidden", type=int, default=128)
     parser.add_argument("--core-dim", type=int, default=32)
     parser.add_argument("--core-lookback", type=int, default=5)
-    parser.add_argument(
-        "--history-encoder", choices=("gru", "transformer"), default="gru",
-        help="History encoder; both variants omit learned lag embeddings",
-    )
-    parser.add_argument("--history-attention-heads", type=int, default=4)
-    parser.add_argument("--history-transformer-layers", type=int, default=2)
-    parser.add_argument(
-        "--output-head", choices=("linear", "tied"), default="linear",
-        help="Independent single linear classifier (default) or tied embedding reference",
-    )
     parser.add_argument("--bucket-dim", type=int, default=16)
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--persistence-scale", type=float, default=2.0)

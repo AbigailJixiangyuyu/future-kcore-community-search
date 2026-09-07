@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Historical protocol only: the active model no longer implements Lag.
-echo "Lag training has been retired. See docs/lag-ablation-results.md and its saved artifacts." >&2
+echo "Lag training has been retired. See docs/archive/model-experiments/lag-ablation-results.md and its saved artifacts." >&2
 exit 2
 
 # Four matched training runs on one GPU, followed by community evaluation.

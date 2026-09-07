@@ -98,10 +98,9 @@ as a full per-query reference implementation.
 `train_coreness.py` builds causal `(u, t) -> coreness(u, t+1)` samples with a
 70/15/15 chronological split and trains `HybridCorenessPredictor`. The model
 encodes the five most recent coreness values with a trainable token table and
-GRU. New training uses an independent single linear output head; the tied
-embedding decoder remains available as a comparison. Bucket embeddings and set
-attention encode the Top-L structural histories, while the fixed T-PPR weighted
-pool remains a residual prior. Residual fusion predicts a correction to the
+GRU. The output head is an independent single linear layer. Bucket embeddings
+and set attention encode the Top-L structural histories; Q-guided attention
+uses T-PPR weights only as a score prior. Residual fusion predicts a correction to the
 current-coreness persistence baseline. Class logits are converted to monotone
 cumulative probabilities and trained with one mildly reweighted ordinal binary
 cross-entropy objective; coreness is decoded as the number of passed thresholds.
@@ -112,13 +111,24 @@ coreness, including a group for historically seen but currently absent nodes;
 future labels are never used for sampling.
 
 The current architecture is documented in detail in
-[`docs/current-token-tied-model-architecture.md`](docs/current-token-tied-model-architecture.md).
+[`docs/current-coreness-model-architecture.md`](docs/current-coreness-model-architecture.md).
 
-The learned Lag table has been removed. The confirmed default is a no-Lag GRU;
-`--history-encoder transformer` selects an experimental two-layer causal
-Transformer with fixed RoPE, four heads, and a 64-dimensional output. Neither
-variant has learned position embeddings. Inference reads the encoder type from
-the checkpoint. Missing coreness history now uses token 0, with no separate
+Structure pooling now uses only path B: set attention followed by
+query-conditioned pooling and LayerNorm. T-PPR weights remain an attention
+score prior. Path A and the pooling CLI selector have been removed.
+Only checkpoints explicitly marked with `structure_pooling="b"` are compatible
+with this pooling design. The historical node-only comparison is documented in
+[`structure pooling results`](docs/archive/model-experiments/structure-pooling-ablation-results.md).
+
+Fusion now uses only `[Q,S]`: `Linear(128,128)` followed by two ordinary
+residual MLP blocks and the 32-dimensional state projection. Four-term
+interaction fusion and its selector have been removed. Existing concat MLP
+checkpoints remain compatible; four-term checkpoints are rejected.
+
+The learned Lag table has been removed. History encoding now uses only a
+no-Lag GRU; the experimental RoPE Transformer and its CLI options have been
+removed. Transformer checkpoints are explicitly rejected. Missing coreness
+history now uses token 0, with no separate
 ABSENT embedding. Checkpoints containing Lag weights or a separate ABSENT
 row are rejected and require retraining rather than silently changing predictions.
 Always use a separate `--output` for experimental models.
@@ -126,25 +136,23 @@ Always use a separate `--output` for experimental models.
 The GRU receives only trainable coreness embeddings, with missing history
 mapped to coreness 0. The unsuccessful structure-history input experiment and
 its CLI flag have been removed; its
-[results](docs/structure-history-ablation-results.md) remain as a historical record.
+[results](docs/archive/model-experiments/structure-history-ablation-results.md) remain as a historical record.
 
-Run the paired email/MOOC encoder comparison with
-`bash scripts/run_history_encoder_ablation.sh <new-output-directory> 42 cuda:0`.
-See [`docs/history-encoder-ablation-results.md`](docs/history-encoder-ablation-results.md)
-for its protocol and results. The completed
-[`Lag ablation`](docs/lag-ablation-results.md) is retained as an experiment record.
+See [history encoder results](docs/archive/model-experiments/history-encoder-ablation-results.md)
+for the historical encoder comparison protocol and results; its runner has
+been removed. The completed
+[`Lag ablation`](docs/archive/model-experiments/lag-ablation-results.md) is retained as an experiment record.
 
-The default output head is `--output-head linear`: `Linear(32, kmax+1)` after
+The only output head is `Linear(32, kmax+1)` after
 the existing 128-to-32 state projection. Its weights are initially copied from
 the input coreness table, but are separate parameters and train independently.
-Use `--output-head tied` for the previous shared-table decoder. Legacy
-compatible checkpoints without an output-head setting load as tied models;
-existing default checkpoint files are not automatically
-replaced by experimental training.
-Run the paired output-head comparison with
-`bash scripts/run_output_head_ablation.sh <new-output-directory> 42 cuda:0`.
-See [`docs/output-head-ablation-results.md`](docs/output-head-ablation-results.md)
-for the protocol and results.
+The tied decoder, output-head selector and dedicated comparison scripts have
+been removed. Checkpoints must explicitly declare `output_head_type="linear"`;
+tied checkpoints and missing output-head metadata are rejected. Existing default
+checkpoint files are not automatically replaced. Compatible local models are
+`results/fusion_ablation_20260907/{email,mooc}/concat.pt`.
+See [historical output-head results](docs/archive/model-experiments/output-head-ablation-results.md);
+archived commands describe retired versions, not the current code.
 
 For inference, `hybrid_community.py` builds one cumulative adjacency and T-PPR
 state through the query time. It predicts `q` first, then deduplicates each BFS
