@@ -223,13 +223,8 @@ def add_core_history_tokens(
     times = arrays.get("times")
     if nodes is None or times is None or len(nodes) != len(times):
         raise ValueError("arrays must contain aligned nodes and times")
-    expected_shape = (len(nodes), lookback)
-    existing = arrays.get("core_history")
-    if existing is not None and existing.shape == expected_shape:
-        return arrays
-
-    absent_token = kmax + 1
-    history = np.full(expected_shape, absent_token, dtype=np.int64)
+    # Missing nodes and positions before the first snapshot have coreness zero.
+    history = np.zeros((len(nodes), lookback), dtype=np.int64)
     for row, (node_value, time_value) in enumerate(zip(nodes, times)):
         node = int(node_value)
         time = int(time_value)
@@ -252,9 +247,7 @@ def _empty_feature_arrays(sample_count, kmax, top_l, structure_width,
                           lookback=DEFAULT_CORE_HISTORY):
     return {
         "temporal": np.zeros((sample_count, kmax), dtype=np.float32),
-        "core_history": np.full(
-            (sample_count, lookback), kmax + 1, dtype=np.int64
-        ),
+        "core_history": np.zeros((sample_count, lookback), dtype=np.int64),
         "neighbor_structures": np.zeros(
             (sample_count, top_l, structure_width), dtype=np.float32
         ),
@@ -271,9 +264,7 @@ def _empty_indexed_feature_arrays(sample_count, kmax, top_l,
                                   lookback=DEFAULT_CORE_HISTORY):
     return {
         "temporal": np.zeros((sample_count, kmax), dtype=np.float32),
-        "core_history": np.full(
-            (sample_count, lookback), kmax + 1, dtype=np.int64
-        ),
+        "core_history": np.zeros((sample_count, lookback), dtype=np.int64),
         "structure_indices": np.zeros(
             (sample_count, top_l), dtype=np.int32
         ),

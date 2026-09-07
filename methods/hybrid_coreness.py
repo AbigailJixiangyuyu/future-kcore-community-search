@@ -51,6 +51,77 @@ class ResidualMLPBlock(nn.Module):
         return values + self.transform(self.norm(values))
 
 
+class RotaryCausalAttentionBlock(nn.Module):
+    """Pre-norm temporal self-attention with fixed RoPE and a causal mask."""
+
+    def __init__(self, width, heads, dropout):
+        super().__init__()
+        if width <= 0 or heads <= 0 or width % heads or (width // heads) % 2:
+            raise ValueError("RoPE requires an even head width and valid heads")
+        self.heads = int(heads)
+        self.head_width = width // heads
+        self.norm = nn.LayerNorm(width)
+        self.qkv = nn.Linear(width, width * 3)
+        self.output = nn.Linear(width, width)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = ResidualMLPBlock(width, dropout)
+        self.register_buffer(
+            "inverse_frequencies",
+            10000.0 ** (-torch.arange(0, self.head_width, 2).float() / self.head_width),
+        )
+
+    def rotate(self, values, position_offset=0):
+        positions = torch.arange(
+            position_offset, position_offset + values.size(-2),
+            device=values.device, dtype=self.inverse_frequencies.dtype,
+        )
+        angles = positions[:, None] * self.inverse_frequencies[None, :]
+        cosine, sine = angles.cos().to(values.dtype), angles.sin().to(values.dtype)
+        even, odd = values[..., 0::2], values[..., 1::2]
+        return torch.stack(
+            (even * cosine - odd * sine, even * sine + odd * cosine),
+            dim=-1,
+        ).flatten(-2)
+
+    def forward(self, values):
+        batch, length, width = values.shape
+        qkv = self.qkv(self.norm(values)).view(
+            batch, length, 3, self.heads, self.head_width
+        )
+        query, key, value = [
+            part.permute(0, 2, 1, 3) for part in qkv.unbind(dim=2)
+        ]
+        query, key = self.rotate(query), self.rotate(key)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / self.head_width ** 0.5
+        future = torch.ones(length, length, device=values.device, dtype=torch.bool).triu(1)
+        attention = torch.softmax(scores.masked_fill(future, float("-inf")), dim=-1)
+        attended = torch.matmul(self.dropout(attention), value)
+        attended = attended.permute(0, 2, 1, 3).reshape(batch, length, width)
+        result = values + self.dropout(self.output(attended))
+        return self.ffn(result)
+
+
+class RotaryHistoryEncoder(nn.Module):
+    """Encode oldest-to-current tokens; missing history uses coreness zero."""
+
+    def __init__(self, input_width, width, heads=4, layers=2, dropout=0.2):
+        super().__init__()
+        if layers <= 0:
+            raise ValueError("history transformer layers must be positive")
+        self.input_projection = nn.Linear(input_width, width)
+        self.blocks = nn.ModuleList([
+            RotaryCausalAttentionBlock(width, heads, dropout)
+            for _ in range(layers)
+        ])
+        self.norm = nn.LayerNorm(width)
+
+    def forward(self, values):
+        values = self.input_projection(values)
+        for block in self.blocks:
+            values = block(values)
+        return self.norm(values)[:, -1]
+
+
 class MaskedSetAttentionBlock(nn.Module):
     """Permutation-equivariant self-attention for padded temporal-node sets."""
 
@@ -150,6 +221,10 @@ class HybridCorenessPredictor(nn.Module):
         attention_heads=4,
         persistence_scale=2.0,
         dropout=0.2,
+        history_encoder_type="gru",
+        history_attention_heads=4,
+        history_transformer_layers=2,
+        output_head_type="linear",
     ):
         super().__init__()
         if kmax <= 0:
@@ -166,18 +241,21 @@ class HybridCorenessPredictor(nn.Module):
             raise ValueError("structure_hidden must be divisible by attention_heads")
         if persistence_scale <= 0:
             raise ValueError("persistence_scale must be positive")
+        if history_encoder_type not in ("gru", "transformer"):
+            raise ValueError("history_encoder_type must be gru or transformer")
+        if output_head_type not in ("tied", "linear"):
+            raise ValueError("output_head_type must be tied or linear")
 
         self.kmax = int(kmax)
         self.hmax = int(hmax)
         self.order = int(order)
         self.core_dim = int(core_dim)
         self.core_lookback = int(core_lookback)
+        self.history_encoder_type = history_encoder_type
+        self.output_head_type = output_head_type
         self.structure_width = order * (hmax + 1)
         self.coreness_table = nn.Parameter(
-            torch.empty(kmax + 2, core_dim).normal_(mean=0.0, std=0.02)
-        )
-        self.lag_table = nn.Parameter(
-            torch.empty(core_lookback, core_dim).normal_(mean=0.0, std=0.02)
+            torch.empty(kmax + 1, core_dim).normal_(mean=0.0, std=0.02)
         )
         self.h_index_bucket_table = nn.Parameter(
             torch.empty(hmax + 1, bucket_dim).normal_(mean=0.0, std=0.02)
@@ -204,9 +282,6 @@ class HybridCorenessPredictor(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.history_encoder = nn.GRU(
-            core_dim, temporal_hidden, batch_first=True
-        )
         self.query_projection = nn.Sequential(
             nn.Linear(core_dim + 2 * temporal_hidden, structure_hidden),
             nn.GELU(),
@@ -229,7 +304,8 @@ class HybridCorenessPredictor(nn.Module):
             [ResidualMLPBlock(fusion_hidden, dropout) for _ in range(2)]
         )
         self.core_projection = nn.Linear(fusion_hidden, core_dim)
-        self.output_bias = nn.Parameter(torch.zeros(kmax + 1))
+        if output_head_type == "tied":
+            self.output_bias = nn.Parameter(torch.zeros(kmax + 1))
         nn.init.zeros_(self.core_projection.weight)
         nn.init.zeros_(self.core_projection.bias)
 
@@ -238,6 +314,34 @@ class HybridCorenessPredictor(nn.Module):
             levels[:, None] - levels[None, :]
         )
         self.register_buffer("persistence_logits", persistence_logits)
+        # Initialize the variable branch after all shared modules, without
+        # changing the RNG state used by shuffling and subsequent training.
+        with torch.random.fork_rng(devices=[]):
+            if history_encoder_type == "gru":
+                self.history_encoder = nn.GRU(
+                    core_dim, temporal_hidden, batch_first=True
+                )
+            else:
+                self.history_encoder = RotaryHistoryEncoder(
+                    core_dim, temporal_hidden, heads=history_attention_heads,
+                    layers=history_transformer_layers, dropout=dropout,
+                )
+        if output_head_type == "linear":
+            # Equal initial classifier values, but no shared Parameter/storage.
+            # Preserve the RNG state of the tied-head reference experiment.
+            with torch.random.fork_rng(devices=[]):
+                self.output_head = nn.Linear(core_dim, kmax + 1)
+            with torch.no_grad():
+                self.output_head.weight.copy_(self.coreness_table[:kmax + 1])
+                self.output_head.bias.zero_()
+
+    def decode_core_state(self, core_state):
+        """Produce learned class logits; the persistence prior is added later."""
+        if self.output_head_type == "linear":
+            return self.output_head(core_state)
+        return torch.matmul(
+            core_state, self.coreness_table[:self.kmax + 1].transpose(0, 1)
+        ) + self.output_bias
 
     def forward(
         self,
@@ -248,12 +352,12 @@ class HybridCorenessPredictor(nn.Module):
         weights,
         mask,
     ):
-        """Return tied-embedding logits for coreness classes ``0..kmax``."""
+        """Return logits for coreness classes ``0..kmax``."""
         if temporal.dim() != 2 or temporal.size(1) != self.kmax:
             raise ValueError("temporal input has an invalid shape")
         if core_history.dim() != 2 or core_history.size(1) != self.core_lookback:
             raise ValueError("core_history has an invalid shape")
-        if torch.any(core_history < 0) or torch.any(core_history > self.kmax + 1):
+        if torch.any(core_history < 0) or torch.any(core_history > self.kmax):
             raise ValueError("core_history contains an invalid token")
         if neighbor_structures.dim() != 3:
             raise ValueError("neighbor_structures must be a 3D tensor")
@@ -294,15 +398,18 @@ class HybridCorenessPredictor(nn.Module):
         )
         prior = torch.sum(normalized_weights.unsqueeze(-1) * tokens, dim=1)
 
-        history_tokens = self.coreness_table[core_history] + self.lag_table
-        _history_output, history_state = self.history_encoder(
-            torch.flip(history_tokens, dims=(1,))
-        )
+        history_tokens = self.coreness_table[core_history]
+        history_tokens = torch.flip(history_tokens, dims=(1,))
+        if self.history_encoder_type == "gru":
+            _history_output, history_state = self.history_encoder(history_tokens)
+            history_state = history_state[-1]
+        else:
+            history_state = self.history_encoder(history_tokens)
         temporal_state = self.temporal_encoder(temporal)
         current_token = core_history[:, 0]
         current_embedding = self.coreness_table[current_token]
         query = self.query_projection(
-            torch.cat((current_embedding, history_state[-1], temporal_state), dim=1)
+            torch.cat((current_embedding, history_state, temporal_state), dim=1)
         )
         for block in self.query_blocks:
             query = block(query)
@@ -320,15 +427,8 @@ class HybridCorenessPredictor(nn.Module):
             fused = block(fused)
 
         core_state = self.core_projection(fused)
-        learned_logits = torch.matmul(
-            core_state, self.coreness_table[:self.kmax + 1].transpose(0, 1)
-        ) + self.output_bias
-        persistence_core = torch.where(
-            current_token <= self.kmax,
-            current_token,
-            torch.zeros_like(current_token),
-        )
-        return self.persistence_logits[persistence_core] + learned_logits
+        learned_logits = self.decode_core_state(core_state)
+        return self.persistence_logits[current_token] + learned_logits
 
     @staticmethod
     def ordinal_logits(class_logits):
@@ -343,11 +443,35 @@ def load_hybrid_coreness_model(checkpoint_path, device="cpu"):
     """Load a model checkpoint written by ``train_coreness.py``."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     objective = checkpoint.get("objective", {})
-    if objective.get("name") != "token_tied_cumulative_ordinal_bce":
+    if objective.get("name") not in (
+        "token_tied_cumulative_ordinal_bce", "hybrid_cumulative_ordinal_bce",
+    ):
         raise ValueError(
-            "checkpoint does not use the token-tied ordinal model; retrain it"
+            "checkpoint does not use the current hybrid ordinal model; retrain it"
         )
-    model = HybridCorenessPredictor(**checkpoint["model_config"])
+    model_config = dict(checkpoint["model_config"])
+    if model_config.pop("history_structure", False) or any(
+        name.startswith("history_input_projection.")
+        for name in checkpoint["state_dict"]
+    ):
+        raise ValueError(
+            "Structure-history inputs have been retired; use a coreness-only "
+            "checkpoint or retrain."
+        )
+    # Checkpoints predating independent output heads always used tied weights.
+    model_config.setdefault("output_head_type", "tied")
+    legacy_lag = model_config.pop("use_lag", False)
+    if legacy_lag or "lag_table" in checkpoint["state_dict"]:
+        raise ValueError(
+            "Lag embeddings have been retired; select a no-Lag checkpoint "
+            "or retrain. Lag weights cannot be silently discarded."
+        )
+    if checkpoint["state_dict"]["coreness_table"].shape[0] == model_config["kmax"] + 2:
+        raise ValueError(
+            "This checkpoint uses a separate ABSENT embedding; missing history "
+            "now uses coreness zero. Retrain the model with the current code."
+        )
+    model = HybridCorenessPredictor(**model_config)
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()

@@ -342,6 +342,10 @@ def train(args):
         "core_dim": args.core_dim,
         "core_lookback": args.core_lookback,
         "bucket_dim": args.bucket_dim,
+        "history_encoder_type": args.history_encoder,
+        "history_attention_heads": args.history_attention_heads,
+        "history_transformer_layers": args.history_transformer_layers,
+        "output_head_type": args.output_head,
         "attention_heads": args.attention_heads,
         "persistence_scale": args.persistence_scale,
         "dropout": args.dropout,
@@ -364,6 +368,7 @@ def train(args):
 
     best_state = None
     best_val_loss = float("inf")
+    best_epoch = 0
     stale_epochs = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -391,6 +396,7 @@ def train(args):
         )
         if validation["loss"] < best_val_loss:
             best_val_loss = validation["loss"]
+            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             stale_epochs = 0
         else:
@@ -418,7 +424,7 @@ def train(args):
         "model_config": model_config,
         "feature_config": feature_config,
         "objective": {
-            "name": "token_tied_cumulative_ordinal_bce",
+            "name": "hybrid_cumulative_ordinal_bce",
             "thresholds": list(range(1, kmax + 1)),
             "decision_logit": 0.0,
             "monotone": True,
@@ -430,6 +436,16 @@ def train(args):
             "train_ratio": args.train_ratio,
             "val_ratio": args.val_ratio,
         },
+        "training_config": {
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "patience": args.patience,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "best_epoch": best_epoch,
+            "epochs_run": epoch,
+        },
         "metrics": {"validation": validation, "test": test},
     }
     torch.save(checkpoint, str(output_path))
@@ -438,6 +454,8 @@ def train(args):
         json.dumps(
             {
                 "objective": checkpoint["objective"],
+                "model_config": model_config,
+                "training_config": checkpoint["training_config"],
                 **checkpoint["metrics"],
             },
             indent=2,
@@ -472,6 +490,16 @@ def build_parser():
     parser.add_argument("--fusion-hidden", type=int, default=128)
     parser.add_argument("--core-dim", type=int, default=32)
     parser.add_argument("--core-lookback", type=int, default=5)
+    parser.add_argument(
+        "--history-encoder", choices=("gru", "transformer"), default="gru",
+        help="History encoder; both variants omit learned lag embeddings",
+    )
+    parser.add_argument("--history-attention-heads", type=int, default=4)
+    parser.add_argument("--history-transformer-layers", type=int, default=2)
+    parser.add_argument(
+        "--output-head", choices=("linear", "tied"), default="linear",
+        help="Independent single linear classifier (default) or tied embedding reference",
+    )
     parser.add_argument("--bucket-dim", type=int, default=16)
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--persistence-scale", type=float, default=2.0)
