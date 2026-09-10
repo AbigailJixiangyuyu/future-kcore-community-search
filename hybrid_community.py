@@ -27,6 +27,7 @@ from methods.hybrid_coreness import (
     predict_coreness_indexed_map,
 )
 from methods.t_ppr import TemporalPPR
+from methods.coreness_edge_generation import generate_predicted_edges
 from methods.tcs_representation import TCSStreamingIndex
 
 
@@ -390,6 +391,25 @@ class HybridCommunityPredictor:
         )
         return self._context
 
+    def generate_edges(self, t, nodes, k, context=None):
+        """Generate edges only within the explicitly selected BFS node set."""
+        context = context or self.prepare_time(t)
+        if context.time != t or context is not self._context:
+            raise ValueError("context is stale or does not match the query time")
+        if self.t_ppr_index.current_time != t:
+            raise ValueError("T-PPR state does not match the query time")
+        selected = set(nodes)
+        if not selected.issubset(context.adjacency):
+            raise ValueError("selected nodes must belong to historical graph")
+        if not selected.issubset(context.coreness_cache):
+            raise ValueError("selected nodes must have cached BFS predictions")
+        return generate_predicted_edges(
+            selected,
+            context.coreness_cache,
+            self.t_ppr_index.top_neighbors,
+            k,
+        )
+
     def predict(self, q, k, t, context=None):
         """Predict one community using the query time's node cache."""
         if not isinstance(k, int) or k <= 0:
@@ -653,6 +673,9 @@ def _evaluate(args):
         ),
         "start_t": start_t,
         "samples": len(samples),
+        "query_set_sha256": hashlib.sha256(json.dumps(sorted(
+            (int(s["query"]), int(s["k"]), int(s["t"])) for s in samples
+        )).encode("ascii")).hexdigest(),
         "examined_node_count": total_examined_nodes,
         "unique_predicted_node_count": total_unique_predictions,
         "reused_prediction_count": (

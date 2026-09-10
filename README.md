@@ -26,14 +26,74 @@ python hybrid_community.py build-state-cache \
   --device cpu --time 343
 ```
 
+### Coreness-guided edge generation
+
+The independent `generated_edge_community.py` script first selects nodes by
+q-rooted BFS through nodes with predicted coreness >= k on the full historical
+graph. It then generates undirected edges only within that selected node set,
+using reverse h-index and raw T-PPR scores. Each source's edge candidates are
+the distinct vertices in its cached T-PPR Top-L records intersected with the
+BFS set, excluding self; historical direct adjacency is not required.
+Scores are summed across temporal records; uncached vertices are excluded.
+For capacity-deficient sources, immediately when each source is visited, the generator
+fills toward effective coreness using direct candidates and then two-hop
+candidates (sum of raw-score products across paths). Effective cores start at
+model predictions and only decrease, down to k. Each decrease is immediately
+visible. Already-visited affected sources are revalidated before first-time
+visits continue; unvisited sources simply read the latest values on first visit.
+Initial visits and the priority revalidation queue each use descending current
+effective core, breaking ties by node ID. Only neighbors with effective core
+>= the target count as support. Directed selection ownership preserves an
+undirected edge if either endpoint still selects it; invalid selections are
+withdrawn immediately and lost support triggers revalidation.
+The queue runs to exhaustion, without full-graph rounds or edge rebuilding.
+Original model predictions stay unchanged. Valid deficit selections are retained
+to avoid mutual withdrawal oscillations. If still insufficient at k, the partial
+result is kept, with no degree/connectivity guarantee. JSON reports final
+effective cores, node-processing/reprocessing counts, and individual core updates.
+It returns these nodes and edges
+directly, without k-core peeling, further connectivity filtering, or removing
+isolates. Edge generation reuses the BFS predictions, not global inference.
+It does not change the existing hybrid threshold-BFS command.
+See [edge generation rules](docs/生成边.md).
+
+```bash
+python generated_edge_community.py 413 7 52 \
+  --slices-dir data/mooc/time_slices/step_43200_window_86400 \
+  --checkpoint results/fusion_ablation_20260907/mooc/concat.pt \
+  --device cuda:0 \
+  --output results/generated_edges/mooc_q413_k7_t52.json
+```
+
+Arguments are `q k t`, with zero-based `t` predicting snapshot `t+1`, and
+`k` restricted to 3–7. An explicit compatible checkpoint is required.
+JSON includes the full community node list, generated edges and graph sizes;
+missing queries or queries with predicted coreness < k return an empty list. Output paths
+must not already exist. This is a single-query prediction, not an evaluation
+against future ground truth.
+
 ### Zebra link-based community prediction
 
 `zebra_community.py` keeps the community target unchanged while using Zebra to
 predict the next graph. Given `(q, k, t)`, it unions q's connected k-core
-communities in snapshots `0..t`, scores every unordered pair in that candidate
-set at `t+1`, retains edges whose bidirectional mean probability is strictly
+communities in snapshots `0..t`, scores only deduplicated historical edges
+whose endpoints are in that candidate set at `t+1`, retains edges whose bidirectional mean probability is strictly
 greater than `0.5`, and returns q's connected component after k-core
 decomposition.
+
+There is no candidate-history window or rho option in the active implementation.
+An edge is eligible if it appeared anywhere in snapshots `0..t`, not necessarily
+inside one of q's historical communities. Self-loops and repeated undirected
+edges are excluded. First appearances after t cannot be scored. This reduces
+decoder work but cannot recover never-before-seen future edges.
+Queries at the same time still share node encoding and historical-edge scores.
+Progressive evaluation reports historical candidate-edge counts, not all-pairs
+counts. Result JSON identifies the full-history, historical-edges-only policy.
+
+The previous sliding-window/all-pairs implementation is preserved unchanged as
+`zebra_community_rho_backup.py`. Run it with the same arguments as before,
+including `--candidate-window-rho 0.2`, to reproduce the rho experiments.
+The historical email rho runner uses this backup, not the active implementation.
 
 ```bash
 # t is the zero-based coreness snapshot index
@@ -48,8 +108,10 @@ The default MOOC paths use the converted `mooc-snapshot` data and its trained
 checkpoint in the sibling `Zebra` repository. The evaluation start is derived
 from Zebra's 85% time boundary; for the current 60-snapshot MOOC data it is
 `t=52`, predicting snapshot 53 (Zebra timestamp 54). Predicted sparse graphs
-are cached in `.zebra_cache/` using the checkpoint, mapping files, threshold,
-time, and node set as the cache identity.
+are cached in `.zebra_cache/` using the policy version, historical-edge index,
+checkpoint, configuration, mapping files, threshold, time, and node set as
+the cache identity. Previous all-pairs graph caches and progressive results
+are not reused; existing checkpoints and experiment artifacts are preserved.
 
 ## Methods
 

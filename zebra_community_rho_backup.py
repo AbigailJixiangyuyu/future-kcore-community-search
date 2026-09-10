@@ -39,9 +39,9 @@ DEFAULT_CHECKPOINT = (
 )
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_PAIR_BATCH_SIZE = 65536
-CACHE_VERSION = 2
+CACHE_VERSION = 1
 EMBEDDING_CACHE_VERSION = 1
-PROGRESSIVE_RESULT_VERSION = 2
+PROGRESSIVE_RESULT_VERSION = 1
 PROGRESSIVE_KS = (7, 6, 5, 4, 3)
 COMMUNITY_METRICS = (
     "precision",
@@ -58,14 +58,20 @@ if "ulong" not in np.__dict__:
     np.ulong = np.uint64
 
 
-def historical_community_union(snapshots, q, k, t):
-    """Union q's connected k-core communities in snapshots 0..t."""
+def historical_community_union(snapshots, q, k, t, window_size=None):
+    """Union q's connected k-core communities in the trailing window."""
     if not isinstance(t, int) or t < 0 or t >= len(snapshots):
         raise IndexError("t is outside the snapshot range")
     if k <= 0:
         raise ValueError("k must be positive")
+    if window_size is not None and (
+        not isinstance(window_size, int) or isinstance(window_size, bool)
+        or window_size <= 0
+    ):
+        raise ValueError("window_size must be a positive integer")
+    start = 0 if window_size is None else max(0, t - window_size + 1)
     candidate = set()
-    for snapshot in snapshots[:t + 1]:
+    for snapshot in snapshots[start:t + 1]:
         k_info = snapshot.get("k_core_comps", {}).get(k)
         if k_info is None or q not in k_info["node_set"]:
             continue
@@ -76,45 +82,27 @@ def historical_community_union(snapshots, q, k, t):
     return frozenset(candidate)
 
 
-class HistoricalEdgeIndex:
-    """Index first appearance; never expose an edge first seen after t."""
-
-    def __init__(self, snapshots):
-        self.snapshot_count = len(snapshots)
-        self.adjacency = defaultdict(dict)
-        digest = hashlib.sha256()
-        for t, snapshot in enumerate(snapshots):
-            for u, v, *_ in snapshot["edge_list"]:
-                u, v = sorted((int(u), int(v)))
-                if u != v and v not in self.adjacency[u]:
-                    self.adjacency[u][v] = t
-        for u in sorted(self.adjacency):
-            for v, first_t in sorted(self.adjacency[u].items()):
-                digest.update(np.asarray((u, v, first_t), dtype=np.int64).tobytes())
-        self.signature = digest.hexdigest()
-
-    def batches(self, original_nodes, t, batch_size=DEFAULT_PAIR_BATCH_SIZE):
-        if not 0 <= t < self.snapshot_count - 1:
-            raise IndexError("prediction requires both t and t+1 snapshots")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        positions = {int(node): i for i, node in enumerate(original_nodes)}
-        if len(positions) != len(original_nodes):
-            raise ValueError("candidate nodes must be unique")
-        left, right = [], []
-        for u, i in positions.items():
-            for v, first_t in self.adjacency.get(u, {}).items():
-                if first_t <= t and v in positions:
-                    left.append(i)
-                    right.append(positions[v])
-                    if len(left) == batch_size:
-                        yield np.asarray(left), np.asarray(right)
-                        left, right = [], []
-        if left:
-            yield np.asarray(left), np.asarray(right)
-
-    def count(self, original_nodes, t):
-        return sum(len(left) for left, _ in self.batches(original_nodes, t))
+def _upper_triangle_batches(node_count, batch_size):
+    left_parts = []
+    right_parts = []
+    buffered = 0
+    for left in range(node_count - 1):
+        right_start = left + 1
+        while right_start < node_count:
+            take = min(batch_size - buffered, node_count - right_start)
+            left_parts.append(np.full(take, left, dtype=np.int64))
+            right_parts.append(np.arange(
+                right_start, right_start + take, dtype=np.int64
+            ))
+            buffered += take
+            right_start += take
+            if buffered == batch_size:
+                yield np.concatenate(left_parts), np.concatenate(right_parts)
+                left_parts = []
+                right_parts = []
+                buffered = 0
+    if buffered:
+        yield np.concatenate(left_parts), np.concatenate(right_parts)
 
 
 class _ProjectedUndirectedDecoder:
@@ -217,8 +205,7 @@ def _sample_identifier(sample):
 
 
 def _prepare_progressive_samples(samples, snapshots, start_t, end_t,
-                                 ks=PROGRESSIVE_KS, edge_index=None):
-    edge_index = edge_index or HistoricalEdgeIndex(snapshots)
+                                 ks=PROGRESSIVE_KS, window_size=None):
     k_order = {k: position for position, k in enumerate(ks)}
     prepared = []
     identifiers = set()
@@ -228,7 +215,7 @@ def _prepare_progressive_samples(samples, snapshots, start_t, end_t,
         if not sample["community"] or t < start_t or t > end_t or k not in k_order:
             continue
         candidate = historical_community_union(
-            snapshots, int(sample["query"]), k, t
+            snapshots, int(sample["query"]), k, t, window_size=window_size
         )
         identifier = _sample_identifier(sample)
         if identifier in identifiers:
@@ -240,8 +227,7 @@ def _prepare_progressive_samples(samples, snapshots, start_t, end_t,
             "sample_id": identifier,
             "candidate": candidate,
             "candidate_size": node_count,
-            "pair_count": edge_index.count(sorted(candidate), t),
-            "all_pair_count": node_count * (node_count - 1) // 2,
+            "pair_count": node_count * (node_count - 1) // 2,
         })
     return sorted(
         prepared,
@@ -262,9 +248,8 @@ def _progressive_run_signature(predictor, samples, start_t, end_t):
     digest.update(predictor.config_hash.encode("ascii"))
     digest.update(predictor.mapping_hash.encode("ascii"))
     digest.update(np.float64(predictor.threshold).tobytes())
-    digest.update(json.dumps(predictor.candidate_metadata,
+    digest.update(json.dumps(predictor.candidate_window_metadata,
                              sort_keys=True).encode("ascii"))
-    digest.update(predictor.edge_index.signature.encode("ascii"))
     digest.update(np.int64(start_t).tobytes())
     digest.update(np.int64(end_t).tobytes())
     for sample in samples:
@@ -355,7 +340,8 @@ class ZebraCommunityPredictor:
 
     def __init__(self, snapshots, zebra_predictor, node_mapping_path,
                  snapshot_mapping_path, threshold=DEFAULT_THRESHOLD,
-                 pair_batch_size=DEFAULT_PAIR_BATCH_SIZE, cache_dir=None):
+                 pair_batch_size=DEFAULT_PAIR_BATCH_SIZE, cache_dir=None,
+                 candidate_window_rho=0.2):
         self.snapshots = snapshots
         self.zebra = zebra_predictor
         self.threshold = float(threshold)
@@ -369,7 +355,20 @@ class ZebraCommunityPredictor:
         self.original_to_zebra = self._load_node_mapping(node_mapping_path)
         self.time_to_zebra = self._load_snapshot_mapping(snapshot_mapping_path)
         self._validate_mappings()
-        self.edge_index = HistoricalEdgeIndex(snapshots)
+        self.candidate_window_rho = float(candidate_window_rho)
+        if not np.isfinite(self.candidate_window_rho) or not (
+            0 < self.candidate_window_rho <= 1
+        ):
+            raise ValueError("candidate_window_rho must be in (0, 1]")
+        train_time = float(np.quantile(self.zebra.graph_df.ts, 0.70))
+        self.train_snapshot_count = sum(
+            timestamp <= train_time for timestamp in self.time_to_zebra.values()
+        )
+        if not self.train_snapshot_count:
+            raise ValueError("Zebra training boundary precedes all snapshots")
+        self.candidate_window_size = max(
+            1, int(np.ceil(self.candidate_window_rho * self.train_snapshot_count))
+        )
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -445,15 +444,16 @@ class ZebraCommunityPredictor:
         return max(eligible)
 
     @property
-    def candidate_metadata(self):
+    def candidate_window_metadata(self):
         return {
-            "candidate_history": "all_snapshots_through_t",
-            "edge_candidates": "historical_edges_only",
+            "candidate_window_rho": self.candidate_window_rho,
+            "train_snapshot_count": self.train_snapshot_count,
+            "candidate_window_size": self.candidate_window_size,
         }
 
     def candidate(self, q, k, t):
         return historical_community_union(
-            self.snapshots, q, k, t
+            self.snapshots, q, k, t, window_size=self.candidate_window_size
         )
 
     def _cache_path(self, original_nodes, t):
@@ -461,7 +461,6 @@ class ZebraCommunityPredictor:
             return None
         digest = hashlib.sha256()
         digest.update(np.int64(CACHE_VERSION).tobytes())
-        digest.update(self.edge_index.signature.encode("ascii"))
         digest.update(self.checkpoint_hash.encode("ascii"))
         digest.update(self.config_hash.encode("ascii"))
         digest.update(self.mapping_hash.encode("ascii"))
@@ -504,7 +503,7 @@ class ZebraCommunityPredictor:
             np.float32, copy=False
         )
 
-    def predict_graph_from_embeddings(self, original_nodes, embeddings, t,
+    def predict_graph_from_embeddings(self, original_nodes, embeddings,
                                       progress_callback=None):
         original_nodes = np.asarray(original_nodes, dtype=np.int64)
         embeddings = torch.as_tensor(
@@ -513,26 +512,22 @@ class ZebraCommunityPredictor:
         if embeddings.ndim != 2 or embeddings.shape[0] != len(original_nodes):
             raise ValueError("cached embeddings do not match candidate nodes")
         return self._decode_graph(
-            original_nodes, embeddings, t, progress_callback=progress_callback
+            original_nodes, embeddings, progress_callback=progress_callback
         )
 
-    def _decode_graph(self, original_nodes, embeddings, t,
+    def _decode_graph(self, original_nodes, embeddings,
                       progress_callback=None):
-        total_pairs = self.edge_index.count(original_nodes, t)
-        if total_pairs == 0:
-            if progress_callback is not None:
-                progress_callback(0, 0)
-            adjacency = sparse.csr_matrix(
-                (len(original_nodes), len(original_nodes)), dtype=np.bool_
-            )
+        if len(original_nodes) == 0:
+            adjacency = sparse.csr_matrix((0, 0), dtype=np.bool_)
             return PredictedGraph(original_nodes, adjacency)
 
+        total_pairs = len(original_nodes) * (len(original_nodes) - 1) // 2
         projected_decoder = _build_projected_decoder(self.zebra, embeddings)
         edge_left = []
         edge_right = []
         completed_pairs = 0
-        for left, right in self.edge_index.batches(
-            original_nodes, t, self.pair_batch_size
+        for left, right in _upper_triangle_batches(
+            len(original_nodes), self.pair_batch_size
         ):
             left_index = torch.from_numpy(left).long().to(self.zebra.device)
             right_index = torch.from_numpy(right).long().to(self.zebra.device)
@@ -578,7 +573,7 @@ class ZebraCommunityPredictor:
         return PredictedGraph(original_nodes, adjacency)
 
     def predict_graph(self, original_nodes, t):
-        """Score only historical edges over candidate nodes, through t."""
+        """Predict all unordered edges over nodes using history through t."""
         if t < 0 or t >= len(self.snapshots) - 1:
             raise IndexError("prediction requires both t and t+1 snapshots")
         original_nodes = np.asarray(sorted(set(original_nodes)), dtype=np.int64)
@@ -596,7 +591,7 @@ class ZebraCommunityPredictor:
         embeddings = self.zebra.encode_nodes(
             zebra_nodes, self.time_to_zebra[t + 1]
         )
-        graph = self._decode_graph(original_nodes, embeddings, t)
+        graph = self._decode_graph(original_nodes, embeddings)
         if cache_path is not None:
             temporary_path = cache_path.with_suffix(".tmp.npz")
             sparse.save_npz(
@@ -634,6 +629,7 @@ def _build_predictor(args):
         threshold=args.threshold,
         pair_batch_size=args.pair_batch_size,
         cache_dir=args.cache_dir,
+        candidate_window_rho=args.candidate_window_rho,
     )
     return predictor, total_nodes
 
@@ -649,7 +645,7 @@ def _query(args):
         "k": args.k,
         "t": args.t,
         "candidate_size": len(candidate),
-        **predictor.candidate_metadata,
+        **predictor.candidate_window_metadata,
         "predicted_edge_count": graph.edge_count,
         "community_size": len(community),
         "community": sorted(community),
@@ -770,7 +766,7 @@ def _build_progress_payload(dataset_name, predictor, samples, records,
         "run_signature": run_signature,
         "checkpoint": str(Path(predictor.zebra.checkpoint_path).resolve()),
         "threshold": predictor.threshold,
-        **predictor.candidate_metadata,
+        **predictor.candidate_window_metadata,
         "pair_batch_size": predictor.pair_batch_size,
         "sample_scope": {
             "start_t": start_t,
@@ -968,7 +964,7 @@ def _progressive_evaluate(args):
     )
     samples = _prepare_progressive_samples(
         raw_samples, predictor.snapshots, args.start_t, end_t,
-        edge_index=predictor.edge_index,
+        window_size=predictor.candidate_window_size,
     )
     if not samples:
         raise ValueError("no non-empty community samples in the selected range")
@@ -1068,8 +1064,7 @@ def _progressive_evaluate(args):
             embedding_dir, sample
         )
         graph = predictor.predict_graph_from_embeddings(
-            candidate_nodes, embeddings, int(sample["t"]),
-            progress_callback=pair_status
+            candidate_nodes, embeddings, progress_callback=pair_status
         )
         prediction = graph.community(
             candidate_nodes, int(sample["query"]), int(sample["k"])
@@ -1192,7 +1187,7 @@ def _evaluate(args):
         "dataset": dataset_name,
         "start_t": start_t,
         "threshold": predictor.threshold,
-        **predictor.candidate_metadata,
+        **predictor.candidate_window_metadata,
         "samples": len(samples),
         "candidate_size_mean": float(np.mean([
             len(sample["candidate"]) for sample in samples
@@ -1221,6 +1216,11 @@ def _add_common_arguments(parser):
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument(
+        "--candidate-window-rho", type=float, default=0.2,
+        help="Candidate history window / Zebra training snapshot count "
+             "(0 < rho <= 1; default: 0.2). Does not truncate model history.",
+    )
     parser.add_argument(
         "--pair-batch-size", type=int, default=DEFAULT_PAIR_BATCH_SIZE
     )
