@@ -423,6 +423,13 @@ def load_hybrid_coreness_model(checkpoint_path, device="cpu"):
             state_dict["structure_token_encoder.0.bias"]
             + weight[:, :legacy_order.numel()] @ legacy_order.reshape(-1)
         )
+    if checkpoint.get("feature_config", {}).get("structure_time_reference") != (
+        "current_observed_snapshot"
+    ):
+        raise ValueError(
+            "checkpoint uses historical or unspecified structure times; retrain "
+            "with current_observed_snapshot structures"
+        )
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()

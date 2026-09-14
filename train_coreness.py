@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from datasets.coreness_prediction_builder import (
+    STRUCTURE_TIME_REFERENCE,
     add_core_history_tokens,
     build_coreness_samples,
     prepare_feature_arrays_by_split,
@@ -77,7 +78,7 @@ def _model_batch(batch, structure_table, device):
 def _feature_cache_stem(kmax, hmax, config):
     max_nodes = config["max_nodes_per_time"]
     return (
-        f"hybrid_features_v7_indexed_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
+        f"hybrid_features_v8_current_snapshot_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
         f"ik{config['t_ppr_internal_top_k']}_"
         f"o{config['order']}_a{config['t_ppr_alpha']}_"
         f"b{config['t_ppr_beta']}_p{config['min_probability']}_"
@@ -287,6 +288,7 @@ def train(args):
         raise ValueError("train, validation, and test splits must all be non-empty")
 
     feature_config = {
+        "structure_time_reference": STRUCTURE_TIME_REFERENCE,
         "top_l": args.top_l,
         "t_ppr_internal_top_k": args.t_ppr_internal_top_k,
         "order": args.order,

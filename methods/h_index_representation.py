@@ -12,23 +12,36 @@ STRUCTURE_DISTRIBUTION_KEY = "structure_distributions"
 
 def has_structure_distributions(snapshot, cmax):
     """Validate a complete, fixed-width snapshot distribution table."""
+    return validated_structure_distributions(snapshot, cmax) is not None
+
+
+def validated_structure_distributions(snapshot, cmax):
+    """Return the cache and sorted row IDs after one validation, or None.
+
+    Callers constructing model inputs can reuse these local references instead
+    of fetching the same cache and sorting the same node IDs a second time.
+    """
     cached = snapshot.get(STRUCTURE_DISTRIBUTION_KEY)
     if not isinstance(cached, dict):
-        return False
+        return None
     rows = cached.get("node_rows")
     values = cached.get("values")
-    return (
+    if not (
         cached.get("version") == STRUCTURE_DISTRIBUTION_VERSION
         and cached.get("order") == MAX_H_INDEX_ORDER + 1
         and cached.get("cmax") == cmax
         and isinstance(rows, dict)
-        and rows == {
-            node: row for row, node in enumerate(sorted(snapshot["core_dict"]))
-        }
         and isinstance(values, np.ndarray)
         and values.dtype == np.float64
         and values.shape == (len(rows), (MAX_H_INDEX_ORDER + 1) * (cmax + 1))
-    )
+    ):
+        return None
+    nodes = sorted(snapshot["core_dict"])
+    if len(rows) != len(nodes) or any(
+        rows.get(node) != row for row, node in enumerate(nodes)
+    ):
+        return None
+    return cached, nodes
 
 
 def add_structure_distributions(snapshot, cmax):

@@ -41,13 +41,16 @@ class PredictedEdgeResult:
         }
 
 
-def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k):
+def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k,
+                             *, scores_for_node=None):
     """Use cached raw T-PPR candidates inside the fixed BFS node set.
 
     Temporal scores for a vertex are summed; two-hop scores sum path products.
     Original predictions are copied, never modified. When a core decreases,
     already-visited affected nodes are revalidated before first-time visits
     continue. Unvisited nodes simply see the latest state when first visited.
+    Optional scores_for_node supplies already-merged raw score dictionaries;
+    these are read-only and still filtered by this query's node set.
     """
     if not isinstance(k, Integral) or k < 1:
         raise ValueError("k must be a positive integer")
@@ -59,6 +62,12 @@ def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k):
 
     direct = {}
     for node in sorted(nodes):
+        if scores_for_node is not None:
+            direct[node] = {
+                candidate: score for candidate, score in scores_for_node(node).items()
+                if candidate in nodes and candidate != node
+            }
+            continue
         scores = {}
         for influence in influences_for_node(node):
             candidate = influence.node

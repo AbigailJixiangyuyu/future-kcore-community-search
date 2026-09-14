@@ -7,10 +7,14 @@ from pathlib import Path
 import numpy as np
 
 from methods.t_ppr import TemporalPPR
+from methods.h_index_representation import (
+    validated_structure_distributions,
+)
 from methods.tcs_representation import TCSStreamingIndex, tcs_representation
 
 
 DEFAULT_CORE_HISTORY = 5
+STRUCTURE_TIME_REFERENCE = "current_observed_snapshot"
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,32 @@ class TimeSliceStructureFeatureTable:
         self._keys.append(key)
         return structure_index
 
+    def index_many(self, nodes, times, mask):
+        """Map temporal-node slots in bulk, preserving first-appearance order."""
+        if self._values is not None:
+            raise RuntimeError("a materialized structure table is immutable")
+        nodes = np.asarray(nodes, dtype=np.int64)
+        times = np.asarray(times, dtype=np.int64)
+        mask = np.asarray(mask, dtype=np.bool_)
+        if nodes.shape != times.shape or nodes.shape != mask.shape:
+            raise ValueError("nodes, times and mask must have identical shapes")
+        result = np.zeros(nodes.shape, dtype=np.int32)
+        if not np.any(mask):
+            return result
+        # Separate int64 fields avoid overflow/collisions from packed node IDs.
+        keys = np.empty(int(mask.sum()), dtype=[("node", np.int64), ("time", np.int64)])
+        keys["node"] = nodes[mask]
+        keys["time"] = times[mask]
+        unique, first, inverse = np.unique(
+            keys, return_index=True, return_inverse=True
+        )
+        indices = np.empty(len(unique), dtype=np.int32)
+        for position in np.argsort(first):
+            key = unique[position]
+            indices[position] = self.index(key["node"], key["time"])
+        result[mask] = indices[inverse]
+        return result
+
     def materialize(self):
         if self._values is not None:
             return self
@@ -80,6 +110,49 @@ class TimeSliceStructureFeatureTable:
 
     def __len__(self):
         return len(self._keys)
+
+
+class CurrentSnapshotStructureFeatureTable:
+    """Read-only model structures from one current observed snapshot only."""
+
+    def __init__(self, values):
+        self.values = values.view()
+        self.values.flags.writeable = False
+
+    def clear(self):
+        self.values = np.empty((0, self.values.shape[1]), dtype=np.float32)
+
+    def __len__(self):
+        return len(self.values)
+
+
+def _current_structure_table(temporal_ppr, order, hmax, t, influences):
+    """Map selected neighbor IDs to G_t, never to their T-PPR event times."""
+    snapshot = temporal_ppr.snapshots[t]
+    if order != 4:
+        return None
+    validated = validated_structure_distributions(snapshot, hmax)
+    if validated is None:
+        return None
+    cached, node_ids = validated
+    known = np.asarray(node_ids, dtype=np.int64)
+    if len(known) + 1 > np.iinfo(np.int32).max:
+        raise OverflowError("current structure table exceeds int32 indexing")
+    values = np.zeros((len(known) + 2, order * (hmax + 1)), dtype=np.float32)
+    # Row 0: invalid slot. Row 1: a selected node absent from G_t; its
+    # closed neighborhood is itself with zero h-index/core in all four groups.
+    values[1, ::hmax + 1] = 1.0
+    values[2:] = cached["values"]
+    mask = influences["mask"]
+    requested = influences["nodes"][mask]
+    positions = np.searchsorted(known, requested)
+    found = positions < len(known)
+    found[found] &= known[positions[found]] == requested[found]
+    selected = np.ones(len(requested), dtype=np.int32)
+    selected[found] = positions[found] + 2
+    indices = np.zeros(mask.shape, dtype=np.int32)
+    indices[mask] = selected
+    return indices, CurrentSnapshotStructureFeatureTable(values)
 
 
 def _sample_by_current_coreness(nodes, current_core, limit, seed):
@@ -225,14 +298,22 @@ def add_core_history_tokens(
         raise ValueError("arrays must contain aligned nodes and times")
     # Missing nodes and positions before the first snapshot have coreness zero.
     history = np.zeros((len(nodes), lookback), dtype=np.int64)
+    history_time = None
+    history_cores = ()
     for row, (node_value, time_value) in enumerate(zip(nodes, times)):
         node = int(node_value)
         time = int(time_value)
-        for lag in range(lookback):
-            snapshot_time = time - lag
-            if snapshot_time < 0:
-                break
-            core_dict = snapshots[snapshot_time]["core_dict"]
+        if time != history_time:
+            # Borrow at most one history window. Drop the previous references
+            # before loading another; never pin all training-time snapshots.
+            history_cores = ()
+            core_dict = None
+            history_cores = tuple(
+                snapshots[snapshot_time]["core_dict"]
+                for snapshot_time in range(time, max(-1, time - lookback), -1)
+            )
+            history_time = time
+        for lag, core_dict in enumerate(history_cores):
             if node not in core_dict:
                 continue
             coreness = int(core_dict[node])
@@ -349,7 +430,7 @@ def prepare_feature_arrays_by_split(
         for split, index in locations[(node, time)]:
             arrays = arrays_by_split[split]
             for position, influence in enumerate(influences):
-                structure_key = (influence.node, influence.time)
+                structure_key = (influence.node, time)
                 structure_index = structure_indices.get(structure_key)
                 if structure_index is None:
                     structure_index = len(structure_keys)
@@ -477,21 +558,29 @@ def prepare_inference_feature_table(
             np.float32, copy=False
         )
 
-    structure_table = TimeSliceStructureFeatureTable(
-        t_ppr_index.temporal_ppr, order=order, hmax=hmax
+    influences = t_ppr_index.top_neighbor_arrays(nodes)
+    mask = influences["mask"]
+    fixed = _current_structure_table(
+        t_ppr_index.temporal_ppr, order, hmax, t, influences
     )
-    for row, node_value in enumerate(nodes):
-        for position, influence in enumerate(
-            t_ppr_index.top_neighbors(int(node_value))
-        ):
-            arrays["structure_indices"][row, position] = structure_table.index(
-                influence.node, influence.time
-            )
-            arrays["time_deltas"][row, position] = t - influence.time
-            arrays["weights"][row, position] = influence.weight
-            arrays["mask"][row, position] = True
+    if fixed is None:
+        # Legacy/manual snapshots or unsupported cache widths retain old behavior.
+        structure_table = TimeSliceStructureFeatureTable(
+            t_ppr_index.temporal_ppr, order=order, hmax=hmax
+        )
+        arrays["structure_indices"] = structure_table.index_many(
+            influences["nodes"], np.full(mask.shape, t, dtype=np.int64), mask
+        )
+        structure_table.materialize()
+    else:
+        arrays["structure_indices"], structure_table = fixed
+    np.subtract(
+        t, influences["times"].astype(np.int64),
+        out=arrays["time_deltas"], where=mask, casting="unsafe",
+    )
+    arrays["weights"][:] = influences["weights"]
+    arrays["mask"][:] = mask
 
-    structure_table.materialize()
     return arrays, structure_table
 
 
@@ -560,12 +649,12 @@ def prepare_inference_feature_arrays(
             influences = tuple(t_ppr_index.top_neighbors(node))
             influence_cache[node] = influences
         for position, influence in enumerate(influences):
-            structure_key = (influence.node, influence.time)
+            structure_key = (influence.node, t)
             structure = structure_cache.get(structure_key)
             if structure is None:
                 structure = t_ppr_index.temporal_ppr.structure_feature(
                     influence.node,
-                    influence.time,
+                    t,
                     order=order,
                     cmax=hmax,
                 ).astype(np.float32, copy=False)

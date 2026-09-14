@@ -18,6 +18,16 @@ Hybrid streaming state can be checkpointed before evaluation without
 materializing model features. The default cache time is the 70% evaluation
 boundary; later `query` and `eval` commands automatically load the newest
 compatible cache at or before their query time.
+Normal Hybrid prediction also creates this cache automatically: on its first
+requested time, load a compatible state if available; otherwise replay history
+(or advance an older compatible state) and save the resulting target-time state.
+A cache hit is not rewritten, and later incremental times do not each create a
+file. The cache stores the cumulative graph and current T-PPR/TCS state, not
+model features or predictions. Current-time model inputs are still constructed
+after restoration. Cache reading and initial writing count toward `prepare_s`;
+the normal cache directory is `model_cache/hybrid_state/` beneath the slice
+directory. Passing `use_cache=False` to `advance_state` disables both automatic
+reading and writing; explicit `build-state-cache` keeps control of its output.
 
 ```bash
 python hybrid_community.py build-state-cache \
@@ -152,6 +162,16 @@ using reverse h-index and raw T-PPR scores. Each source's edge candidates are
 the distinct vertices in its cached T-PPR Top-L records intersected with the
 BFS set, excluding self; historical direct adjacency is not required.
 Scores are summed across temporal records; uncached vertices are excluded.
+The default predictor reads raw T-PPR node/score arrays in batches, without
+creating influence objects or normalizing unused weights. Merged first-order
+score rows are cached for nodes requested by edge generation at the current
+time, and reused across queries. Every query still filters those rows by its
+own BFS set; two-hop scores and propagation state remain query-specific.
+The score cache is cleared with the time context, retains no historical rows,
+and uses at most O(M * top_l) entries for M distinct requested source nodes.
+Initial row construction is included in query/edge-generation timing, not
+moved into prepare_s. Historical-neighbor and capacity-40 comparison paths
+retain their existing candidate adapters.
 For capacity-deficient sources, immediately when each source is visited, the generator
 fills toward effective coreness using direct candidates and then two-hop
 candidates (sum of raw-score products across paths). Effective cores start at
@@ -274,13 +294,62 @@ tables in old caches, without rebuilding already-cached graph decompositions;
 cache replacement is atomic. The first load of an old cache consequently takes
 longer and uses additional disk space. Subsequent loads reuse the tables.
 
-For each selected `(node, historical_time)`, `TemporalPPR.structure_feature`
-now reads the cached row. Full current-time model inputs are still materialized
-once per prediction time; their shared structure table gathers cached rows
-instead of recalculating histograms. Historical rows can be reused across
-prediction times. The reference calculation remains available for manually
-constructed snapshots, absent nodes, or custom widths/orders. The float32 model
-inputs and the model architecture are unchanged.
+For a task at observed time `t` predicting `t+1`, every T-PPR-selected neighbor
+uses its structure in **G_t**, not the historical event snapshot stored in its
+T-PPR record. Predicting snapshot 53 therefore uses structures from snapshot 52.
+The record age `t-event_time`, influence weights and selected slots are unchanged.
+Repeated records for the same neighbor share the current structure row.
+Training, full-time inference and single-query feature building all use this rule.
+The reference calculation remains available for manual snapshots and custom
+widths/orders; it also reads G_t. A selected node absent from G_t has each
+distribution concentrated in bucket zero, not an invalid padding slot.
+
+Full-time inference now reads T-PPR records through `top_neighbor_arrays`,
+without constructing per-slot `TemporalInfluence` objects. Nodes, timestamps,
+scores and masks are gathered in bulk; weights are normalized over each row's
+exact valid prefix. Inference builds only the current snapshot's float32 table,
+with direct node-ID row lookup rather than `(node,time)` deduplication.
+The table has a padding row, an absent-node row, and the current snapshot's rows.
+It is shared by all queries at t and released with the context; no append-only
+historical float32 table remains. Construction is charged to `prepare_s`.
+Community prediction now uses a field-partitioned disk snapshot store:
+`core_dict` retains at most the model's history length (default five slices);
+edges, float64 distributions and other snapshot metadata each retain at most
+one slice. Snapshot views themselves hold no loaded payload. After full-time
+input materialization the original distribution/graph payloads are released;
+only the current float32 model structure table remains. Evaluation loads future
+truth separately and drops it after that time's queries.
+Streaming-only T-PPR keeps its current Top-20 state and a compact static node-ID
+index, not all historical interactions or per-snapshot adjacency tables. TCS
+keeps its recursive state, and BFS still requires the cumulative historical
+graph. Thus memory is bounded by these necessary states and current/recent
+features, **not independent of cumulative graph size**.
+
+On first use, `snapshot_cache/partitioned/` is generated from the legacy cache;
+this one-time migration still reads the complete legacy pickle and needs its
+peak memory. Later runs open only the partitioned store. The legacy files are
+preserved, and training/Zebra retain their existing loaders. A legacy cache
+size/mtime change invalidates the partitioned generation; publishing the new
+index is atomic and old generations are not automatically deleted.
+This is an I/O/retention change, not a model change; current-snapshot checkpoints
+need no retraining. Disk reads during state/feature preparation count toward
+`prepare_s`; future-truth reads remain evaluation time.
+History input assembly borrows the recent core dictionaries once per consecutive
+sample-time group, rather than traversing the snapshot cache for every node/lag.
+Only one history window is borrowed at a time, with no dictionary copies or
+persistent extra cache. Current structure-table validation and materialization
+reuse one cache fetch and one sorted node list.
+Time deltas, weights and masks are filled with array operations.
+Unknown nodes and invalid slots remain zero
+and masked. The scalar `top_neighbors` API remains unchanged for edge generation
+and other callers; maintained T-PPR state, ranking and capacity are unchanged.
+
+This corrects the old feature semantics and requires retraining. Training uses
+the new `hybrid_features_v8_current_snapshot_*` cache namespace and never reuses
+v7 historical-structure inputs. Checkpoints must explicitly contain
+`feature_config.structure_time_reference="current_observed_snapshot"`; missing
+or different metadata is rejected. Old caches/checkpoints are retained on disk,
+not overwritten or silently converted.
 
 Distribution precomputation belongs to snapshot preprocessing (or the one-time
 cache upgrade), not `prepare_s`. End-to-end timing for a newly arriving snapshot

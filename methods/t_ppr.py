@@ -207,7 +207,7 @@ class TemporalPPRStreamingIndex:
         self.min_score = float(min_score)
         self.current_time = -1
         self._nodes = np.asarray(
-            sorted(int(node) for node in temporal_ppr._history),
+            temporal_ppr.node_ids,
             dtype=np.int64,
         )
         shape = (len(self._nodes), self.internal_top_k)
@@ -230,7 +230,7 @@ class TemporalPPRStreamingIndex:
         return rows
 
     def _advance_snapshot(self, snapshot_time):
-        adjacency = self.temporal_ppr._snapshot_adjacency[snapshot_time]
+        adjacency = self.temporal_ppr.snapshot_adjacency(snapshot_time)
         if not adjacency:
             return
 
@@ -310,6 +310,89 @@ class TemporalPPRStreamingIndex:
             self.current_time = snapshot_time
         return self
 
+    def top_neighbor_arrays(self, nodes, top_l=None):
+        """Read Top-L rows in bulk without creating TemporalInfluence objects.
+
+        Return independent arrays, preserving requested order and duplicates.
+        Missing nodes and padding have mask=False and zero values. Normalize
+        equal-length groups over exactly the stored prefix, matching the scalar
+        summation order even for partially filled rows.
+        """
+        limit = self.top_l if top_l is None else top_l
+        if not isinstance(limit, int) or not 0 < limit <= self.internal_top_k:
+            raise ValueError("top_l must be positive and at most internal_top_k")
+        if self.current_time < 0:
+            raise RuntimeError("advance_to must be called before querying")
+        nodes = np.asarray(nodes, dtype=np.int64)
+        if nodes.ndim != 1:
+            raise ValueError("nodes must be a one-dimensional array")
+        shape = (len(nodes), limit)
+        result = {
+            "nodes": np.zeros(shape, dtype=np.int64),
+            "times": np.zeros(shape, dtype=np.int32),
+            "scores": np.zeros(shape, dtype=np.float64),
+            "weights": np.zeros(shape, dtype=np.float64),
+            "mask": np.zeros(shape, dtype=np.bool_),
+        }
+        if not len(nodes) or not len(self._nodes):
+            return result
+        rows = np.searchsorted(self._nodes, nodes)
+        found = rows < len(self._nodes)
+        found[found] &= self._nodes[rows[found]] == nodes[found]
+        destinations = np.flatnonzero(found)
+        source_rows = rows[found]
+        lengths = np.minimum(self._state_lengths[source_rows], limit)
+        result["nodes"][destinations] = self._state_nodes[source_rows, :limit]
+        result["times"][destinations] = self._state_times[source_rows, :limit]
+        result["scores"][destinations] = self._state_scores[source_rows, :limit]
+        for length in np.unique(lengths):
+            if length == 0:
+                continue
+            selected = destinations[lengths == length]
+            scores = result["scores"][selected, :length]
+            totals = scores.sum(axis=1)
+            nonzero = totals != 0.0
+            selected = selected[nonzero]
+            result["weights"][selected, :length] = (
+                scores[nonzero] / totals[nonzero, None]
+            )
+            result["mask"][selected, :length] = True
+        invalid = ~result["mask"]
+        for key in ("nodes", "times", "scores"):
+            result[key][invalid] = 0
+        return result
+
+    def top_neighbor_scores(self, nodes, top_l=None):
+        """Merge raw Top-L scores by vertex, without objects or normalization.
+
+        The caller owns the returned dictionaries. Record-order addition and
+        zero-total handling match top_neighbors exactly. No query-set filtering
+        is applied, so a time-local caller may reuse rows across queries.
+        """
+        limit = self.top_l if top_l is None else top_l
+        if not isinstance(limit, int) or not 0 < limit <= self.internal_top_k:
+            raise ValueError("top_l must be positive and at most internal_top_k")
+        if self.current_time < 0:
+            raise RuntimeError("advance_to must be called before querying")
+        nodes = np.asarray(nodes, dtype=np.int64)
+        if nodes.ndim != 1:
+            raise ValueError("nodes must be a one-dimensional array")
+        rows = np.searchsorted(self._nodes, nodes)
+        result = {}
+        for node, row in zip(nodes, rows):
+            node = int(node)
+            scores = result[node] = {}
+            if row >= len(self._nodes) or self._nodes[row] != node:
+                continue
+            length = min(int(self._state_lengths[row]), limit)
+            raw_scores = self._state_scores[row, :length]
+            if not length or float(raw_scores.sum()) == 0.0:
+                continue
+            for candidate, score in zip(self._state_nodes[row, :length], raw_scores):
+                candidate = int(candidate)
+                scores[candidate] = scores.get(candidate, 0.0) + float(score)
+        return result
+
     def top_neighbors(self, node, top_l=None):
         """Read up to Top-L stored influences without changing maintained state."""
         limit = self.top_l if top_l is None else top_l
@@ -342,7 +425,7 @@ class TemporalPPRStreamingIndex:
 class TemporalPPR:
     """Answer causal top-L T-PPR queries over an ordered snapshot sequence."""
 
-    def __init__(self, snapshots, alpha=0.3, beta=0.5):
+    def __init__(self, snapshots, alpha=0.3, beta=0.5, streaming_only=False):
         if not isinstance(snapshots, Sequence):
             raise TypeError("snapshots must be an ordered sequence")
         if not snapshots:
@@ -355,6 +438,20 @@ class TemporalPPR:
         self.snapshots = snapshots
         self.alpha = float(alpha)
         self.beta = float(beta)
+        self.streaming_only = bool(streaming_only)
+        if self.streaming_only:
+            # Disk stores supply a compact static ID index, preserving state
+            # cache row numbering without loading any historical interactions.
+            node_ids = getattr(snapshots, "node_ids", None)
+            if node_ids is None:
+                nodes = set()
+                for snapshot in snapshots:
+                    for edge in snapshot["edge_list"]:
+                        if edge[0] != edge[1]:
+                            nodes.update(edge[:2])
+                node_ids = sorted(nodes)
+            self.node_ids = np.asarray(node_ids, dtype=np.int64)
+            return
         history = defaultdict(list)
         snapshot_adjacency = []
 
@@ -393,14 +490,29 @@ class TemporalPPR:
             )
 
         self._history = dict(history)
+        self.node_ids = np.asarray(sorted(self._history), dtype=np.int64)
         self._snapshot_adjacency = snapshot_adjacency
         self._history_times = {
             node: [time for time, _ in interactions]
             for node, interactions in self._history.items()
         }
 
+    def snapshot_adjacency(self, time):
+        if not self.streaming_only:
+            return self._snapshot_adjacency[time]
+        adjacency = defaultdict(set)
+        for edge in self.snapshots[time]["edge_list"]:
+            u, v = edge[:2]
+            if u != v:
+                adjacency[u].add(v)
+                adjacency[v].add(u)
+        return {node: tuple(sorted(neighbors))
+                for node, neighbors in adjacency.items()}
+
     def _transitions(self, node, cutoff):
         """Return older temporal neighbors and beta-decayed probabilities."""
+        if self.streaming_only:
+            raise ValueError("Exact historical walks require non-streaming TemporalPPR")
         interactions = self._history.get(node, ())
         if not interactions:
             return ()
@@ -591,7 +703,7 @@ class TemporalPPR:
             time,
             order=order,
             cmax=cmax,
-            adjacency=self._snapshot_adjacency[time],
+            adjacency=self.snapshot_adjacency(time),
         )
 
     def structural_embedding(

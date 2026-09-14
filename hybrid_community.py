@@ -6,8 +6,9 @@ import hashlib
 import json
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import torch
@@ -17,10 +18,13 @@ from datasets.community_eval_builder import (
     set_metrics,
 )
 from datasets.coreness_prediction_builder import (
+    CurrentSnapshotStructureFeatureTable,
+    STRUCTURE_TIME_REFERENCE,
     TimeSliceStructureFeatureTable,
     prepare_inference_feature_table,
 )
-from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
+from datasets.dataset_builder import load_time_slice_manifest
+from datasets.snapshot_store import open_snapshot_store, SnapshotStore
 from methods.hybrid_coreness import (
     LayeredCommunityResult,
     layered_threshold_bfs,
@@ -68,16 +72,18 @@ class HybridTimeContext:
     time: int
     adjacency: dict
     feature_table: dict
-    structure_table: TimeSliceStructureFeatureTable
+    structure_table: Union[TimeSliceStructureFeatureTable, CurrentSnapshotStructureFeatureTable]
     coreness_cache: dict
     state_update_s: float
     feature_materialize_s: float
+    edge_neighbor_scores: dict = field(default_factory=dict)
 
     def release(self):
         """Drop data that is valid only for this query time."""
         self.feature_table.clear()
         self.structure_table.clear()
         self.coreness_cache.clear()
+        self.edge_neighbor_scores.clear()
 
 
 class HybridCommunityPredictor:
@@ -91,6 +97,8 @@ class HybridCommunityPredictor:
         self.model = model
         self.checkpoint = checkpoint
         self.hmax = int(hmax)
+        if isinstance(snapshots, SnapshotStore):
+            snapshots.set_core_lookback(model.core_lookback)
         self.batch_size = int(batch_size)
         if device is None:
             device = next(model.parameters()).device
@@ -102,6 +110,7 @@ class HybridCommunityPredictor:
             snapshots,
             alpha=self.feature_config["t_ppr_alpha"],
             beta=self.feature_config["t_ppr_beta"],
+            streaming_only=True,
         )
         self.t_ppr_index = self.t_ppr.streaming_index(
             top_l=self.feature_config["top_l"],
@@ -123,6 +132,11 @@ class HybridCommunityPredictor:
         self.state_cache_identity = state_cache_identity
 
     def _validate_config(self):
+        if self.feature_config.get("structure_time_reference") != STRUCTURE_TIME_REFERENCE:
+            raise ValueError(
+                "checkpoint uses historical or unspecified structure times; "
+                "retrain with current_observed_snapshot structures"
+            )
         required = {
             "top_l",
             "t_ppr_internal_top_k",
@@ -352,8 +366,12 @@ class HybridCommunityPredictor:
         )
         return cache_path
 
-    def advance_state(self, t, use_cache=True):
-        """Advance only graph/T-PPR/TCS state, without feature materialization."""
+    def advance_state(self, t, use_cache=True, auto_save=True):
+        """Restore or compute state; persist the first requested time on a miss.
+
+        Later times advance in memory without producing one cache per snapshot.
+        Explicit cache-building commands disable auto_save to control the output.
+        """
         if not isinstance(t, int):
             raise TypeError("t must be an integer snapshot index")
         if t < 0 or t >= len(self.snapshots) - 1:
@@ -362,13 +380,20 @@ class HybridCommunityPredictor:
             raise ValueError("predictor time cannot move backwards")
 
         started = time.perf_counter()
+        first_cached_advance = (
+            use_cache and self._current_time < 0
+            and self.state_cache_dir is not None
+        )
         # Invalidate before mutating the shared graph or streaming indexes.
         # Explicit advance_state() calls must not leave old features usable.
         if self._context is not None and t != self._context.time:
             self._context.release()
             self._context = None
+        if isinstance(self.snapshots, SnapshotStore):
+            self.snapshots.retain_for_prediction(t, self.model.core_lookback)
         if use_cache and self._current_time < 0:
             self._restore_best_state_cache(t)
+        target_cache_hit = self._current_time == t
         for snapshot_time in range(self._current_time + 1, t + 1):
             snapshot = self.snapshots[snapshot_time]
             for node in snapshot.get("core_dict", {}):
@@ -383,6 +408,12 @@ class HybridCommunityPredictor:
             self.t_ppr_index.advance_to(snapshot_time)
             self.tcs_index.advance_to(snapshot_time)
         self._current_time = t
+        if first_cached_advance and auto_save and not target_cache_hit:
+            cache_path = self.save_state_cache()
+            print(
+                "[hybrid_state] Saved t={} to {}".format(t, cache_path),
+                flush=True,
+            )
         return time.perf_counter() - started
 
     def prepare_time(self, t):
@@ -408,6 +439,8 @@ class HybridCommunityPredictor:
             core_lookback=self.model.core_lookback,
         )
         feature_materialize_s = time.perf_counter() - feature_started
+        if isinstance(self.snapshots, SnapshotStore):
+            self.snapshots.release_payloads()
         self._context = HybridTimeContext(
             time=t,
             adjacency=self._adjacency,
@@ -431,11 +464,17 @@ class HybridCommunityPredictor:
             raise ValueError("selected nodes must belong to historical graph")
         if not selected.issubset(context.coreness_cache):
             raise ValueError("selected nodes must have cached BFS predictions")
+        missing = sorted(selected - context.edge_neighbor_scores.keys())
+        if missing:
+            context.edge_neighbor_scores.update(
+                self.t_ppr_index.top_neighbor_scores(missing)
+            )
         return generate_predicted_edges(
             selected,
             context.coreness_cache,
-            self.t_ppr_index.top_neighbors,
+            None,
             k,
+            scores_for_node=context.edge_neighbor_scores.__getitem__,
         )
 
     def predict(self, q, k, t, context=None):
@@ -508,7 +547,7 @@ def _state_cache_identity(slices_dir):
 
 def _build_predictor(args):
     slices_dir = Path(args.slices_dir)
-    snapshots, total_nodes, kmax, hmax = build_snapshots(slices_dir)
+    snapshots, total_nodes, kmax, hmax = open_snapshot_store(slices_dir)
     device = _resolve_device(args.device)
     checkpoint_path = _resolve_checkpoint_path(slices_dir, args.checkpoint)
     model, checkpoint = load_hybrid_coreness_model(
@@ -677,7 +716,7 @@ def _build_state_cache(args):
     )
     started = time.perf_counter()
     state_update_s = predictor.advance_state(
-        cache_time, use_cache=not args.rebuild
+        cache_time, use_cache=not args.rebuild, auto_save=False
     )
     output_path = predictor.save_state_cache(
         cache_time, output_path=args.output
@@ -795,6 +834,12 @@ def _evaluate(args, *, predictor_builder=None, metadata=None):
         total_state_update_s += preparation["state_update_s"]
         total_feature_materialize_s += preparation["feature_materialize_s"]
         total_query_s += query_s
+        if isinstance(predictor.snapshots, SnapshotStore):
+            # Future truth is evaluation-only; do not retain it between slices.
+            predictor.snapshots.retain_for_prediction(
+                t, predictor.model.core_lookback
+            )
+            predictor.snapshots.release_payloads()
 
     per_k = _aggregate(rows)
     macro = {}
