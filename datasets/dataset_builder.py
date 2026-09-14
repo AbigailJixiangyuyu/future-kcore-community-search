@@ -10,7 +10,10 @@ Pipeline:
 
 import csv
 import json
+import os
 import pickle
+import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,7 +21,11 @@ import networkit as nk
 
 from methods.h_index_representation import (
     MAX_H_INDEX_ORDER,
+    STRUCTURE_DISTRIBUTION_KEY,
+    STRUCTURE_DISTRIBUTION_VERSION,
+    add_structure_distributions,
     compute_h_index_levels,
+    has_structure_distributions,
 )
 
 
@@ -163,6 +170,8 @@ def _build_snapshot(slice_edges):
 
 def _add_h_index_features(snapshot):
     """Add the fixed set of h-index levels used by structural features."""
+    # Derived distributions cannot survive a rebuild of their source values.
+    snapshot.pop(STRUCTURE_DISTRIBUTION_KEY, None)
     h_index_dicts = compute_h_index_levels(
         snapshot["edge_list"],
         snapshot["core_dict"],
@@ -187,6 +196,45 @@ def _has_h_index_features(snapshot):
             for order in range(1, MAX_H_INDEX_ORDER + 1)
         )
     )
+
+
+def _prepare_structure_distributions(snapshots, hmax):
+    """Upgrade legacy snapshots after the dataset-wide bucket width is known."""
+    started = time.perf_counter()
+    built = 0
+    for snapshot in snapshots:
+        if not has_structure_distributions(snapshot, hmax):
+            add_structure_distributions(snapshot, hmax)
+            built += 1
+    if built:
+        print(
+            "[dataset_builder] Precomputed structure distributions for "
+            "{} snapshots in {:.3f}s (hmax={})".format(
+                built, time.perf_counter() - started, hmax
+            ),
+            flush=True,
+        )
+    return bool(built)
+
+
+def _write_snapshot_cache(cache_path, snapshots, total_nodes, kmax, hmax):
+    """Replace an upgraded cache only after the complete pickle is written."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=cache_path.parent, prefix="snapshots-", suffix=".tmp",
+            delete=False,
+        ) as cache_file:
+            temporary_path = Path(cache_file.name)
+            pickle.dump(
+                {"snapshots": snapshots, "total_nodes": total_nodes,
+                 "kmax": kmax, "hmax": hmax},
+                cache_file, protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        os.replace(temporary_path, cache_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def build_snapshots(slices_dir):
@@ -228,18 +276,10 @@ def build_snapshots(slices_dir):
             cache_changed = True
         if cached.get("hmax") != hmax:
             cache_changed = True
+        if _prepare_structure_distributions(snapshots, hmax):
+            cache_changed = True
         if cache_changed:
-            with cache_path.open("wb") as cache_file:
-                pickle.dump(
-                    {
-                        "snapshots": snapshots,
-                        "total_nodes": total_nodes,
-                        "kmax": kmax,
-                        "hmax": hmax,
-                    },
-                    cache_file,
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                )
+            _write_snapshot_cache(cache_path, snapshots, total_nodes, kmax, hmax)
             print(f"[dataset_builder] Upgraded snapshot cache at {cache_path}")
         metadata = {
             "snapshot_count": len(snapshots),
@@ -247,6 +287,9 @@ def build_snapshots(slices_dir):
             "kmax": kmax,
             "hmax": hmax,
             "max_h_index_order": MAX_H_INDEX_ORDER,
+            "structure_distribution_version": STRUCTURE_DISTRIBUTION_VERSION,
+            "structure_distribution_order": MAX_H_INDEX_ORDER + 1,
+            "structure_distribution_cmax": hmax,
         }
         if (
             not metadata_path.exists()
@@ -276,18 +319,9 @@ def build_snapshots(slices_dir):
     total_nodes = len(total_node_ids)
     kmax = max((snapshot["max_core"] for snapshot in snapshots), default=0)
     hmax = max((snapshot["max_h_index"] for snapshot in snapshots), default=0)
+    _prepare_structure_distributions(snapshots, hmax)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with cache_path.open("wb") as cache_file:
-        pickle.dump(
-            {
-                "snapshots": snapshots,
-                "total_nodes": total_nodes,
-                "kmax": kmax,
-                "hmax": hmax,
-            },
-            cache_file,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
+    _write_snapshot_cache(cache_path, snapshots, total_nodes, kmax, hmax)
     metadata_path.write_text(
         json.dumps(
             {
@@ -296,6 +330,9 @@ def build_snapshots(slices_dir):
                 "kmax": kmax,
                 "hmax": hmax,
                 "max_h_index_order": MAX_H_INDEX_ORDER,
+                "structure_distribution_version": STRUCTURE_DISTRIBUTION_VERSION,
+                "structure_distribution_order": MAX_H_INDEX_ORDER + 1,
+                "structure_distribution_cmax": hmax,
             },
             indent=2,
         )

@@ -28,6 +28,123 @@ python hybrid_community.py build-state-cache \
 
 ### Coreness-guided edge generation
 
+Community batch evaluation now generates edges after each BFS query and reports
+`edge_case1_ratio`, `edge_case2_ratio`, and `edge_case3_ratio` alongside F1/Jaccard.
+These fractions describe final undirected edges by the case that created their
+current lifetime; reverse-endpoint selections do not double-count or relabel an
+edge, while complete deletion and recreation reset its attribution.
+Per-K ratios average non-edgeless queries; macro ratios average valid K means.
+Edgeless queries have zero counts and `null` ratios and are reported separately
+as `edge_ratio_empty_samples` (versus `edge_ratio_valid_samples`).
+`edge_case1_count`–`edge_case3_count` are cumulative audit counts, not macro
+weights. JSON ratios are in [0,1]; multiply by 100 for percentage display.
+`edge_generation_s` reports generation time; query time includes this step.
+F1/Jaccard still use the unchanged BFS node set, with no peeling.
+
+Batch evaluation also reports `edge_precision`, `edge_recall`, `edge_f1`,
+and `edge_jaccard`. Predictions are all final generated edges; truth consists
+only of edges in snapshot t+1 with both endpoints in q's true connected k-core
+community. A predicted edge outside that community is incorrect even if it
+exists elsewhere in the future snapshot. Undirected edges are deduplicated and
+self-loops excluded. Per-K values average all queries, and macro values average
+K=3–7 means. An empty prediction against nonempty truth scores zero for all four
+metrics; both sets empty scores one, matching node-set evaluation.
+These metrics are shared by the default T-PPR 20, T-PPR 40 and historical-neighbor
+batch evaluators. Future edges are used only for evaluation, never prediction.
+Truth extraction and metric calculation are excluded from community query time
+(`elapsed_s` and `query_s`), but included in wall time. Pure single-query prediction
+does not require a future snapshot.
+
+Community timing outputs use `timing_version=2` and the monotonic
+`time.perf_counter()` clock. The single-query and batch interfaces share these
+definitions (all durations are seconds):
+
+| Field | Scope |
+|---|---|
+| `load_s` | CLI predictor construction, including snapshot/model loading and index initialization |
+| `state_update_s` | Historical state restoration/advancement performed during this preparation |
+| `feature_materialize_s` | Feature-table construction performed during this preparation |
+| `prepare_s` | Complete `prepare_time` call, including state/feature work and preparation overhead |
+| `bfs_selection_s` | BFS, feature gathering, model inference, CPU/GPU transfers and prediction-cache lookup |
+| `edge_generation_s` | Final edge generation, propagation and generation-result construction |
+| `query_s`, `elapsed_s` | Identical: `bfs_selection_s + edge_generation_s`; excludes preparation and evaluation |
+| `prediction_total_s` | `prepare_s + query_s`; excludes loading, evaluation and output serialization |
+| `wall_s` | CLI entry into prediction/evaluation work through result readiness; includes loading and evaluation, excludes JSON serialization and output |
+
+`state_update_s` and `feature_materialize_s` are components of `prepare_s`,
+not additional terms to add to it. A reused time context reports zero for those
+two components, but the preparation/cache lookup itself is still timed.
+Prediction-cache hits still incur BFS/generation work; new/reused node prediction
+counts indicate the actual inference work. Returning predictions to CPU
+synchronizes the inference results before the BFS timer ends.
+
+Batch top-level durations are totals; `prepare_s` is charged once per queried
+time, while per-K and macro `elapsed_s`/`query_s` are query means and then K means.
+`amortized_prediction_s` is `(total prepare_s + total query_s) / sample_count`,
+or `null` for no samples; it is a sample-weighted amortized duration, **not** a
+cold independent-query latency or a K-macro mean. `sample_prepare_s` measures
+evaluation sample preparation; `metric_s` measures per-query truth/metric work.
+Both are excluded from `prediction_total_s`. Other evaluation bookkeeping and
+progress logging remain included in `wall_s`.
+
+The node-only `hybrid_community.py query` has `prediction_scope=nodes_only` and
+zero edge-generation time. The complete `generated_edge_community.py` CLI
+reports `nodes_and_edges`. When its `predict_community()` function receives an
+already constructed predictor, loading is outside its scope: `load_s` is omitted
+and `wall_scope` explicitly identifies function-level timing.
+
+Historical JSON files are unchanged. Before version 2, single-query `elapsed_s`
+included preparation, `bfs_selection_s` also included preparation, and batch
+`wall_s` excluded loading/sample preparation. Do not compare these legacy
+fields directly to version-2 fields. No cache is cleared or model warmed up
+automatically for timing; report cache conditions when comparing cold and warm
+queries. These timing changes apply to our shared evaluator and its candidate
+variants, not the independent Zebra/HCU evaluators.
+
+`case3_lowered_node_ratio` is the number of distinct nodes lowered by case 3
+divided by all selected BFS community nodes. Repeated decreases of one node
+count once. Empty communities have `null` ratios and are excluded from averaging;
+nonempty but edgeless communities are included. Per-K query means and valid-K
+macro means use this independent valid set, audited by `core_ratio_valid_samples`,
+`core_ratio_empty_samples`, and cumulative `case3_lowered_node_count`.
+
+For the independent historical-neighbor candidate ablation, use
+`historical_neighbor_community.py query ...` or `eval`. It preserves the model,
+BFS and propagation rules but sets N(v) to historical direct neighbors through t
+inside the BFS set. Cached raw T-PPR scores are summed by vertex; missing scores
+are zero, with node-ID tie-breaking. Two-hop candidates use these historical
+neighbor sets (and may introduce nonhistorical edges). This is not guaranteed to
+be a superset of the original T-PPR candidates. The default method is unchanged.
+
+```bash
+python historical_neighbor_community.py eval \
+  --slices-dir data/mooc/time_slices/step_43200_window_86400 \
+  --checkpoint results/fusion_ablation_20260907/mooc/concat.pt \
+  --start-t 52 --device cuda:0 \
+  --output results/mooc_historical_neighbors.json
+```
+
+The comparison script rejects existing output paths and reports the same
+per-K/macro metrics, including case-3 lowered-node ratios. F1/Jaccard should
+remain unchanged because the selected node set is unchanged; compare edge
+composition, lowering and runtime, not node accuracy, to assess this ablation.
+
+`tppr40_community.py` offers the same `query` / `eval` CLI for a different ablation:
+the shared T-PPR state maintains 40 temporal records, model features still read
+Top-20, and edge candidates read all Top-40. It uses the existing model without
+retraining and isolates state caches under `tppr40_model20`. Unlike the
+historical-neighbor-only change, the wider maintained state can change the model's
+Top-20 inputs, predicted coreness and BFS node sets; compare F1/Jaccard as well as
+lowering ratios. Forty temporal records do not guarantee forty distinct vertices.
+
+```bash
+python tppr40_community.py eval \
+  --slices-dir data/mooc/time_slices/step_43200_window_86400 \
+  --checkpoint results/fusion_ablation_20260907/mooc/concat.pt \
+  --start-t 52 --device cuda:0 \
+  --output results/mooc_tppr40.json
+```
+
 The independent `generated_edge_community.py` script first selects nodes by
 q-rooted BFS through nodes with predicted coreness >= k on the full historical
 graph. It then generates undirected edges only within that selected node set,
@@ -56,6 +173,8 @@ directly, without k-core peeling, further connectivity filtering, or removing
 isolates. Edge generation reuses the BFS predictions, not global inference.
 It does not change the existing hybrid threshold-BFS command.
 See [edge generation rules](docs/生成边.md).
+See the [MOOC/email T-PPR capacity 20 vs 40 report](docs/tppr-capacity20-vs40-mooc-email-20260910.md)
+for full evaluation results, per-K metrics, lowering ratios, and timing tradeoffs.
 
 ```bash
 python generated_edge_community.py 413 7 52 \
@@ -145,6 +264,29 @@ closed-neighborhood distributions for orders `1..order-1` and current
 coreness, using buckets `0..hmax-1` plus a final `>=hmax` bucket. Because
 `hmax` is the global maximum, the last bucket represents the exact maximum;
 its width is `order * (hmax + 1)` for `order` in `1..4`.
+
+Snapshot preprocessing also persists **all nodes' four closed-neighborhood
+distributions**, not just the underlying h-index/coreness values. Each snapshot
+stores a node-to-row index and a float64 matrix of shape
+`[snapshot_nodes, 4 * (hmax + 1)]`, with a version and bucket-width metadata.
+`build_snapshots` automatically fills missing or incompatible distribution
+tables in old caches, without rebuilding already-cached graph decompositions;
+cache replacement is atomic. The first load of an old cache consequently takes
+longer and uses additional disk space. Subsequent loads reuse the tables.
+
+For each selected `(node, historical_time)`, `TemporalPPR.structure_feature`
+now reads the cached row. Full current-time model inputs are still materialized
+once per prediction time; their shared structure table gathers cached rows
+instead of recalculating histograms. Historical rows can be reused across
+prediction times. The reference calculation remains available for manually
+constructed snapshots, absent nodes, or custom widths/orders. The float32 model
+inputs and the model architecture are unchanged.
+
+Distribution precomputation belongs to snapshot preprocessing (or the one-time
+cache upgrade), not `prepare_s`. End-to-end timing for a newly arriving snapshot
+must include that preprocessing cost; moving the work outside `prepare_s` is
+not itself an end-to-end speedup. The savings come from avoiding repeated
+historical distribution calculations across later prediction times.
 
 `methods.t_ppr.TemporalPPR` selects influential historical time-nodes using an
 inverse-time random walk with termination probability `alpha` and recency

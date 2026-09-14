@@ -16,6 +16,29 @@ class PredictedEdgeResult:
     node_update_count: int
     reprocessed_node_count: int
     core_updates: tuple
+    edge_case_counts: tuple
+
+    @property
+    def edge_case_ratios(self):
+        return tuple(count / len(self.edges) if self.edges else None
+                     for count in self.edge_case_counts)
+
+    def edge_metrics(self):
+        """JSON-ready final-edge counts and fractions (undefined for no edges)."""
+        return {
+            **{f"edge_case{i}_count": count
+               for i, count in enumerate(self.edge_case_counts, 1)},
+            **{f"edge_case{i}_ratio": ratio
+               for i, ratio in enumerate(self.edge_case_ratios, 1)},
+        }
+
+    def core_reduction_metrics(self):
+        """Case-3 unique lowered nodes divided by all selected BFS nodes."""
+        count = len({node for node, _, _ in self.core_updates})
+        return {
+            "case3_lowered_node_count": count,
+            "case3_lowered_node_ratio": count / len(self.nodes) if self.nodes else None,
+        }
 
 
 def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k):
@@ -42,13 +65,16 @@ def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k):
             if candidate in nodes and candidate != node:
                 scores[candidate] = scores.get(candidate, 0.0) + influence.score
         direct[node] = scores
+    # Reuse ID-ordered rows without changing the order of floating-point sums.
+    ordered_direct = {node: tuple(sorted(scores.items()))
+                      for node, scores in direct.items()}
     second = {}
     for node, scores in direct.items():
         paths = {}
-        for middle in sorted(scores):
-            for candidate, score in sorted(direct[middle].items()):
+        for middle, first_score in ordered_direct[node]:
+            for candidate, score in ordered_direct[middle]:
                 if candidate != node:
-                    paths[candidate] = paths.get(candidate, 0.0) + scores[middle] * score
+                    paths[candidate] = paths.get(candidate, 0.0) + first_score * score
         second[node] = paths
     engine = _ImmediateEdgePropagation(
         {node: int(predicted_coreness[node]) for node in nodes}, direct, second, k
@@ -72,6 +98,7 @@ class _ImmediateEdgePropagation:
         self.selected = {v: set() for v in effective}
         self.owners = {v: set() for v in effective}
         self.adjacency = {v: set() for v in effective}
+        self.edge_cases = {}
         self.dependents = {v: set() for v in effective}
         self.rankings = {}
         for source in effective:
@@ -107,7 +134,9 @@ class _ImmediateEdgePropagation:
         for node in sorted(set(nodes) & self.visited):
             self._enqueue(node, urgent=True)
 
-    def _add_selection(self, source, target):
+    def _add_selection(self, source, target, case):
+        if target not in self.adjacency[source]:
+            self.edge_cases[tuple(sorted((source, target)))] = case
         self.selected[source].add(target)
         self.owners[target].add(source)
         self.adjacency[source].add(target)
@@ -120,6 +149,7 @@ class _ImmediateEdgePropagation:
         if source not in self.selected[target]:
             self.adjacency[source].remove(target)
             self.adjacency[target].remove(source)
+            del self.edge_cases[tuple(sorted((source, target)))]
             self._revalidate((source, target))
 
     def _capacity(self, node):
@@ -161,19 +191,23 @@ class _ImmediateEdgePropagation:
             for target in sorted(self.selected[node] - desired):
                 self._remove_selection(node, target)
             for target in sorted(desired - self.selected[node]):
-                self._add_selection(node, target)
+                self._add_selection(node, target, 2 if capacity > core else 1)
             return
 
         # Case 3: preserve valid existing choices; do not withdraw merely because
         # another endpoint now provides sufficient support.
+        # No other node is processed during this call. Each added edge below is
+        # new and eligible, so its contribution is exactly one until we yield.
+        support = self._support_count(node)
         for ranked in self.rankings[node]:
             for candidate in ranked:
-                if self._support_count(node) >= core:
+                if support >= core:
                     return
                 if (candidate not in self.adjacency[node]
                         and self.effective[candidate] >= core):
-                    self._add_selection(node, candidate)
-        if self._support_count(node) < core and core > self.k:
+                    self._add_selection(node, candidate, 3)
+                    support += 1
+        if support < core and core > self.k:
             # Yield after each decrease so previously processed affected nodes
             # can react before unrelated, never-visited nodes are processed.
             self._lower(node)
@@ -198,4 +232,8 @@ class _ImmediateEdgePropagation:
             reprocessed_node_count=sum(max(0, count - 1)
                                        for count in self.process_counts.values()),
             core_updates=tuple(self.core_updates),
+            edge_case_counts=tuple(
+                sum(case == i for case in self.edge_cases.values())
+                for i in (1, 2, 3)
+            ),
         )

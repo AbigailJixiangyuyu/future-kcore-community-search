@@ -22,6 +22,7 @@ from datasets.coreness_prediction_builder import (
 )
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from methods.hybrid_coreness import (
+    LayeredCommunityResult,
     layered_threshold_bfs,
     load_hybrid_coreness_model,
     predict_coreness_indexed_map,
@@ -36,6 +37,28 @@ DEFAULT_SLICES = ROOT / "data/mooc/time_slices/step_43200_window_86400"
 DEFAULT_BATCH_SIZE = 512
 EVALUATION_KS = (3, 4, 5, 6, 7)
 STATE_CACHE_VERSION = 1
+TIMING_SCHEMA = {
+    "timing_version": 2,
+    "timing_clock": "perf_counter",
+    "elapsed_scope": "bfs_and_inference_plus_edge_generation",
+    "prediction_total_scope": "prepare_plus_query_excluding_load_and_evaluation",
+    "wall_scope": "entry_to_result_ready_excluding_serialization_and_output",
+}
+
+
+def prepare_timed_context(predictor, t):
+    """Charge preparation only to the call that performs it, never cache hits."""
+    previous = getattr(predictor, "_context", None)
+    started = time.perf_counter()
+    context = predictor.prepare_time(t)
+    prepare_s = time.perf_counter() - started
+    reused = context is previous
+    return context, {
+        "prepare_s": prepare_s,
+        "state_update_s": 0.0 if reused else context.state_update_s,
+        "feature_materialize_s": 0.0 if reused else context.feature_materialize_s,
+        "context_cache_hit": reused,
+    }
 
 
 @dataclass
@@ -338,7 +361,12 @@ class HybridCommunityPredictor:
         if t < self._current_time:
             raise ValueError("predictor time cannot move backwards")
 
-        started = time.time()
+        started = time.perf_counter()
+        # Invalidate before mutating the shared graph or streaming indexes.
+        # Explicit advance_state() calls must not leave old features usable.
+        if self._context is not None and t != self._context.time:
+            self._context.release()
+            self._context = None
         if use_cache and self._current_time < 0:
             self._restore_best_state_cache(t)
         for snapshot_time in range(self._current_time + 1, t + 1):
@@ -355,19 +383,19 @@ class HybridCommunityPredictor:
             self.t_ppr_index.advance_to(snapshot_time)
             self.tcs_index.advance_to(snapshot_time)
         self._current_time = t
-        return time.time() - started
+        return time.perf_counter() - started
 
     def prepare_time(self, t):
         """Advance state and materialize shared features for query time ``t``."""
-        if self._context is not None and t == self._current_time:
+        # Validate even on cache hits; advance_state also invalidates old context.
+        state_update_s = self.advance_state(t)
+        if self._context is not None and self._context.time == t:
             return self._context
         if self._context is not None:
             self._context.release()
             self._context = None
 
-        state_update_s = self.advance_state(t)
-
-        feature_started = time.time()
+        feature_started = time.perf_counter()
         feature_table, structure_table = prepare_inference_feature_table(
             self.snapshots,
             self._adjacency,
@@ -379,7 +407,7 @@ class HybridCommunityPredictor:
             order=self.model.order,
             core_lookback=self.model.core_lookback,
         )
-        feature_materialize_s = time.time() - feature_started
+        feature_materialize_s = time.perf_counter() - feature_started
         self._context = HybridTimeContext(
             time=t,
             adjacency=self._adjacency,
@@ -421,9 +449,11 @@ class HybridCommunityPredictor:
             raise ValueError("context time does not match the query")
         if context is not self._context:
             raise ValueError("context is stale; prepare the query time again")
+        if q not in context.adjacency:
+            return LayeredCommunityResult(frozenset(), {}, 0, 0)
 
         def predict_batch(nodes):
-            nodes = sorted(set(nodes))
+            # layered_threshold_bfs already supplies sorted, unique node IDs.
             missing = [
                 node for node in nodes if node not in context.coreness_cache
             ]
@@ -504,10 +534,22 @@ def _build_predictor(args):
 
 
 def _query(args):
+    wall_start = time.perf_counter()
     predictor, _ = _build_predictor(args)
-    started = time.time()
-    result = predictor.predict(args.q, args.k, args.t)
+    load_s = time.perf_counter() - wall_start
+    context, preparation = prepare_timed_context(predictor, args.t)
+    started = time.perf_counter()
+    result = predictor.predict(args.q, args.k, args.t, context=context)
+    query_s = time.perf_counter() - started
     payload = {
+        **TIMING_SCHEMA,
+        **preparation,
+        "prediction_scope": "nodes_only",
+        "load_s": load_s,
+        "bfs_selection_s": query_s,
+        "edge_generation_s": 0.0,
+        "query_s": query_s,
+        "prediction_total_s": preparation["prepare_s"] + query_s,
         "q": args.q,
         "k": args.k,
         "t": args.t,
@@ -522,9 +564,28 @@ def _query(args):
         ),
         "bfs_layers": result.bfs_layers,
         "community": sorted(result.community),
-        "elapsed_s": time.time() - started,
+        "elapsed_s": query_s,
     }
+    payload["wall_s"] = time.perf_counter() - wall_start
     print(json.dumps(payload, ensure_ascii=True))
+
+
+def _edge_prediction_metrics(predicted_edges, target_snapshot, true_community):
+    """Compare final generated edges with the target community's induced edges."""
+    community = set(true_community)
+    truth = {
+        (min(u, v), max(u, v))
+        for u, v, *_ in target_snapshot["edge_list"]
+        if u != v and u in community and v in community
+    }
+    prediction = {
+        (min(u, v), max(u, v))
+        for u, v in predicted_edges if u != v
+    }
+    return {
+        f"edge_{name}": value
+        for name, value in set_metrics(prediction, truth).items()
+    }
 
 
 def _aggregate(rows):
@@ -534,11 +595,18 @@ def _aggregate(rows):
         "recall",
         "f1",
         "jaccard",
+        "edge_precision",
+        "edge_recall",
+        "edge_f1",
+        "edge_jaccard",
         "size_ratio",
         "pred_ratio",
         "predicted_node_count",
         "bfs_layers",
         "elapsed_s",
+        "query_s",
+        "bfs_selection_s",
+        "edge_generation_s",
     )
     for k, values in sorted(rows.items()):
         result[k] = {
@@ -546,7 +614,59 @@ def _aggregate(rows):
             for name in metric_names
         }
         result[k]["samples"] = len(values)
+        lowered_valid = [
+            row for row in values if row["case3_lowered_node_ratio"] is not None
+        ]
+        result[k]["core_ratio_valid_samples"] = len(lowered_valid)
+        result[k]["core_ratio_empty_samples"] = len(values) - len(lowered_valid)
+        result[k]["case3_lowered_node_count"] = sum(
+            row["case3_lowered_node_count"] for row in values
+        )
+        result[k]["case3_lowered_node_ratio"] = (
+            float(np.mean([row["case3_lowered_node_ratio"] for row in lowered_valid]))
+            if lowered_valid else None
+        )
+        valid = [row for row in values if row["edge_case1_ratio"] is not None]
+        result[k]["edge_ratio_valid_samples"] = len(valid)
+        result[k]["edge_ratio_empty_samples"] = len(values) - len(valid)
+        for i in (1, 2, 3):
+            result[k][f"edge_case{i}_count"] = sum(
+                row[f"edge_case{i}_count"] for row in values
+            )
+            result[k][f"edge_case{i}_ratio"] = (
+                float(np.mean([row[f"edge_case{i}_ratio"] for row in valid]))
+                if valid else None
+            )
     return result
+
+
+def _edge_aggregate_summary(per_k):
+    """Equal-weight valid K means, with separate cumulative audit counts."""
+    summary = {
+        name: sum(row[name] for row in per_k.values())
+        for name in (
+            "edge_ratio_valid_samples", "edge_ratio_empty_samples",
+            "core_ratio_valid_samples", "core_ratio_empty_samples",
+            "case3_lowered_node_count",
+        )
+    }
+    lowered_valid = [row for row in per_k.values()
+                     if row["core_ratio_valid_samples"] > 0]
+    summary["case3_lowered_node_ratio"] = (
+        float(np.mean([row["case3_lowered_node_ratio"] for row in lowered_valid]))
+        if lowered_valid else None
+    )
+    valid = [row for row in per_k.values()
+             if row["edge_ratio_valid_samples"] > 0]
+    for i in (1, 2, 3):
+        summary[f"edge_case{i}_count"] = sum(
+            row[f"edge_case{i}_count"] for row in per_k.values()
+        )
+        summary[f"edge_case{i}_ratio"] = (
+            float(np.mean([row[f"edge_case{i}_ratio"] for row in valid]))
+            if valid else None
+        )
+    return summary
 
 
 def _build_state_cache(args):
@@ -555,7 +675,7 @@ def _build_state_cache(args):
         int(len(predictor.snapshots) * 0.7)
         if args.time is None else args.time
     )
-    started = time.time()
+    started = time.perf_counter()
     state_update_s = predictor.advance_state(
         cache_time, use_cache=not args.rebuild
     )
@@ -567,13 +687,16 @@ def _build_state_cache(args):
         "path": str(output_path.resolve()),
         "size_bytes": output_path.stat().st_size,
         "state_update_s": state_update_s,
-        "wall_s": time.time() - started,
+        "wall_s": time.perf_counter() - started,
     }
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
 
-def _evaluate(args):
-    predictor, total_nodes = _build_predictor(args)
+def _evaluate(args, *, predictor_builder=None, metadata=None):
+    wall_start = time.perf_counter()
+    predictor, total_nodes = (predictor_builder or _build_predictor)(args)
+    load_s = time.perf_counter() - wall_start
+    sample_started = time.perf_counter()
     manifest = load_time_slice_manifest(args.slices_dir)
     dataset_name = manifest["dataset"]
     split_t = int(len(predictor.snapshots) * 0.7)
@@ -597,35 +720,59 @@ def _evaluate(args):
         samples_by_t[sample["t"]].append(sample)
 
     rows = defaultdict(list)
-    wall_start = time.time()
+    sample_prepare_s = time.perf_counter() - sample_started
     total_examined_nodes = 0
     total_unique_predictions = 0
     total_state_update_s = 0.0
     total_feature_materialize_s = 0.0
     total_query_s = 0.0
+    total_edge_generation_s = 0.0
+    total_prepare_s = 0.0
+    total_bfs_s = 0.0
+    metric_s = 0.0
     for t, time_samples in sorted(samples_by_t.items()):
-        context = predictor.prepare_time(t)
-        query_started = time.time()
+        context, preparation = prepare_timed_context(predictor, t)
+        total_prepare_s += preparation["prepare_s"]
+        query_s = 0.0
         predicted_at_time = 0
         new_predictions_at_time = 0
         for sample in time_samples:
-            started = time.time()
+            started = time.perf_counter()
             prediction = predictor.predict(
                 sample["query"], sample["k"], sample["t"], context=context
             )
-            elapsed = time.time() - started
+            edge_started = time.perf_counter()
+            bfs_selection_s = edge_started - started
+            total_bfs_s += bfs_selection_s
+            generated = predictor.generate_edges(
+                t, prediction.community, sample["k"], context=context
+            )
+            edge_generation_s = time.perf_counter() - edge_started
+            total_edge_generation_s += edge_generation_s
+            elapsed = bfs_selection_s + edge_generation_s
+            query_s += elapsed
             predicted_at_time += prediction.predicted_node_count
             new_predictions_at_time += prediction.newly_predicted_node_count
+            metric_started = time.perf_counter()
             metrics = set_metrics(prediction.community, sample["community"])
+            edge_metrics = _edge_prediction_metrics(
+                generated.edges, predictor.snapshots[t + 1], sample["community"]
+            )
             rows[sample["k"]].append({
                 **metrics,
+                **edge_metrics,
                 "size_ratio": len(prediction.community) / len(sample["community"]),
                 "pred_ratio": len(prediction.community) / total_nodes * 100,
                 "predicted_node_count": prediction.predicted_node_count,
                 "bfs_layers": prediction.bfs_layers,
                 "elapsed_s": elapsed,
+                "query_s": elapsed,
+                "bfs_selection_s": bfs_selection_s,
+                "edge_generation_s": edge_generation_s,
+                **generated.edge_metrics(),
+                **generated.core_reduction_metrics(),
             })
-        query_s = time.time() - query_started
+            metric_s += time.perf_counter() - metric_started
         print(
             "t={} samples={} examined_nodes={} new_predictions={} "
             "cache_hits={} nodes={} structures={} state_update_s={:.3f} "
@@ -645,8 +792,8 @@ def _evaluate(args):
         )
         total_examined_nodes += predicted_at_time
         total_unique_predictions += new_predictions_at_time
-        total_state_update_s += context.state_update_s
-        total_feature_materialize_s += context.feature_materialize_s
+        total_state_update_s += preparation["state_update_s"]
+        total_feature_materialize_s += preparation["feature_materialize_s"]
         total_query_s += query_s
 
     per_k = _aggregate(rows)
@@ -657,16 +804,46 @@ def _evaluate(args):
             "recall",
             "f1",
             "jaccard",
+            "edge_precision",
+            "edge_recall",
+            "edge_f1",
+            "edge_jaccard",
             "size_ratio",
             "pred_ratio",
             "predicted_node_count",
             "bfs_layers",
             "elapsed_s",
+            "query_s",
+            "bfs_selection_s",
+            "edge_generation_s",
         ):
             macro[name] = float(np.mean([
                 result[name] for result in per_k.values()
             ]))
+    edge_summary = _edge_aggregate_summary(per_k)
+    macro.update({name: value for name, value in edge_summary.items()
+                  if name.endswith("_ratio")})
     payload = {
+        **(metadata or {}),
+        **TIMING_SCHEMA,
+        "prediction_scope": "nodes_and_edges",
+        "cache_policy": "shared_per_time_in_sample_order",
+        "load_s": load_s,
+        "sample_prepare_s": sample_prepare_s,
+        "metric_s": metric_s,
+        "prepare_s": total_prepare_s,
+        "bfs_selection_s": total_bfs_s,
+        "prediction_total_s": total_prepare_s + total_query_s,
+        "elapsed_s": total_query_s,
+        "amortized_prediction_s": (
+            (total_prepare_s + total_query_s) / len(samples) if samples else None
+        ),
+        **{name: value for name, value in edge_summary.items()
+           if not name.endswith("_ratio")},
+        "edge_attribution": "final_edge_latest_creation_case",
+        "edge_ratio_aggregation": "query_mean_then_valid_k_mean_excluding_edgeless",
+        "core_ratio_aggregation": "query_mean_then_valid_k_mean_excluding_empty_communities",
+        "core_ratio_denominator": "all_bfs_community_nodes",
         "dataset": dataset_name,
         "checkpoint": str(
             _resolve_checkpoint_path(args.slices_dir, args.checkpoint).resolve()
@@ -684,10 +861,11 @@ def _evaluate(args):
         "state_update_s": total_state_update_s,
         "feature_materialize_s": total_feature_materialize_s,
         "query_s": total_query_s,
+        "edge_generation_s": total_edge_generation_s,
         "per_k": per_k,
         "macro": macro,
-        "wall_s": time.time() - wall_start,
     }
+    payload["wall_s"] = time.perf_counter() - wall_start
     print(json.dumps(payload, indent=2, sort_keys=True))
     if args.output:
         output_path = Path(args.output)

@@ -16,7 +16,10 @@ from typing import Optional
 import numpy as np
 from numba import njit, prange
 
-from methods.h_index_representation import structure_representation
+from methods.h_index_representation import (
+    cached_structure_representation,
+    structure_representation,
+)
 
 
 @dataclass(frozen=True)
@@ -307,15 +310,18 @@ class TemporalPPRStreamingIndex:
             self.current_time = snapshot_time
         return self
 
-    def top_neighbors(self, node):
-        """Return the configured Top-L influences at the current time."""
+    def top_neighbors(self, node, top_l=None):
+        """Read up to Top-L stored influences without changing maintained state."""
+        limit = self.top_l if top_l is None else top_l
+        if not isinstance(limit, int) or not 0 < limit <= self.internal_top_k:
+            raise ValueError("top_l must be positive and at most internal_top_k")
         if self.current_time < 0:
             raise RuntimeError("advance_to must be called before querying")
         node = int(node)
         row = int(np.searchsorted(self._nodes, node))
         if row >= len(self._nodes) or self._nodes[row] != node:
             return ()
-        length = min(int(self._state_lengths[row]), self.top_l)
+        length = min(int(self._state_lengths[row]), limit)
         if not length:
             return ()
         scores = self._state_scores[row, :length]
@@ -568,7 +574,17 @@ class TemporalPPR:
         )
 
     def structure_feature(self, node, time, order, cmax):
-        """Return S_time(node) using the prebuilt snapshot adjacency index."""
+        """Read precomputed distributions; retain legacy/custom-input support."""
+        if (
+            isinstance(time, int) and 0 <= time < len(self.snapshots)
+            and isinstance(order, int) and 1 <= order <= 4
+            and isinstance(cmax, int) and cmax >= 0
+        ):
+            cached = cached_structure_representation(
+                self.snapshots[time], node, order, cmax
+            )
+            if cached is not None:
+                return cached
         return structure_representation(
             self.snapshots,
             node,

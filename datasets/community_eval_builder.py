@@ -317,7 +317,7 @@ def set_metrics(prediction, truth):
     return {
         "precision": precision,
         "recall": recall,
-        "f1": 2 * precision * recall / (precision + recall),
+        "f1": 2 * precision * recall / (precision + recall) if intersection_size else 0.0,
         "jaccard": intersection_size / len(prediction | truth),
     }
 

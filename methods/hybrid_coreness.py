@@ -570,7 +570,9 @@ def layered_threshold_bfs(q, k, adjacency, predict_batch):
     predicted = {}
 
     def predict(nodes):
-        nodes = sorted(set(nodes) - set(predicted))
+        nodes = set(nodes)
+        nodes.difference_update(predicted)
+        nodes = sorted(nodes)
         if not nodes:
             return {}
         values = predict_batch(nodes)

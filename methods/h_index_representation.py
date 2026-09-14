@@ -6,6 +6,82 @@ import numpy as np
 
 
 MAX_H_INDEX_ORDER = 3
+STRUCTURE_DISTRIBUTION_VERSION = 1
+STRUCTURE_DISTRIBUTION_KEY = "structure_distributions"
+
+
+def has_structure_distributions(snapshot, cmax):
+    """Validate a complete, fixed-width snapshot distribution table."""
+    cached = snapshot.get(STRUCTURE_DISTRIBUTION_KEY)
+    if not isinstance(cached, dict):
+        return False
+    rows = cached.get("node_rows")
+    values = cached.get("values")
+    return (
+        cached.get("version") == STRUCTURE_DISTRIBUTION_VERSION
+        and cached.get("order") == MAX_H_INDEX_ORDER + 1
+        and cached.get("cmax") == cmax
+        and isinstance(rows, dict)
+        and rows == {
+            node: row for row, node in enumerate(sorted(snapshot["core_dict"]))
+        }
+        and isinstance(values, np.ndarray)
+        and values.dtype == np.float64
+        and values.shape == (len(rows), (MAX_H_INDEX_ORDER + 1) * (cmax + 1))
+    )
+
+
+def add_structure_distributions(snapshot, cmax):
+    """Precompute every node's four distributions once, before inference.
+
+    Keep float64 to exactly preserve the existing structural-feature API;
+    model-input materialization still casts to float32 as before.
+    """
+    if not isinstance(cmax, int):
+        raise TypeError("cmax must be an integer")
+    if cmax < 0:
+        raise ValueError("cmax must be non-negative")
+    nodes = sorted(snapshot["core_dict"])
+    adjacency = {node: set() for node in nodes}
+    for edge in snapshot["edge_list"]:
+        u, v = edge[:2]
+        if u != v:
+            adjacency.setdefault(u, set()).add(v)
+            adjacency.setdefault(v, set()).add(u)
+    order = MAX_H_INDEX_ORDER + 1
+    values = np.empty((len(nodes), order * (cmax + 1)), dtype=np.float64)
+    for row, node in enumerate(nodes):
+        values[row] = structure_representation(
+            [snapshot], node, 0, order, cmax, adjacency=adjacency
+        )
+    snapshot[STRUCTURE_DISTRIBUTION_KEY] = {
+        "version": STRUCTURE_DISTRIBUTION_VERSION,
+        "order": order,
+        "cmax": cmax,
+        "node_rows": {node: row for row, node in enumerate(nodes)},
+        "values": values,
+    }
+
+
+def cached_structure_representation(snapshot, node, order, cmax):
+    """Read a matching preprocessed row, or return None for legacy callers.
+
+    A copy preserves the old API: modifying a returned feature cannot corrupt
+    the snapshot cache. Custom widths/orders and absent nodes use the reference
+    calculation instead of silently reading incompatible buckets.
+    """
+    cached = snapshot.get(STRUCTURE_DISTRIBUTION_KEY)
+    if (
+        not isinstance(cached, dict)
+        or cached.get("version") != STRUCTURE_DISTRIBUTION_VERSION
+        or cached.get("order") != order
+        or cached.get("cmax") != cmax
+    ):
+        return None
+    row = cached["node_rows"].get(node)
+    if row is None:
+        return None
+    return cached["values"][row].copy()
 
 
 def _h_index(values):

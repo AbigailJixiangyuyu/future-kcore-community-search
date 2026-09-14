@@ -10,7 +10,9 @@ from hybrid_community import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_SLICES,
     EVALUATION_KS,
+    TIMING_SCHEMA,
     _build_predictor,
+    prepare_timed_context,
 )
 
 
@@ -18,15 +20,33 @@ def predict_community(predictor, q, k, t):
     """Run the full model-to-community pipeline without inspecting t+1 edges."""
     if k not in EVALUATION_KS:
         raise ValueError("k must be in 3..7")
-    started = time.time()
-    context = predictor.prepare_time(t)
+    wall_start = time.perf_counter()
+    context, preparation = prepare_timed_context(predictor, t)
+    started = time.perf_counter()
     selected = set()
+    prediction = None
     if q in context.adjacency:
-        selected = predictor.predict(q, k, t, context=context).community
-    selected_at = time.time()
+        prediction = predictor.predict(q, k, t, context=context)
+        selected = prediction.community
+    selected_at = time.perf_counter()
     result = predictor.generate_edges(t, selected, k, context=context)
-    finished = time.time()
-    return {
+    finished = time.perf_counter()
+    query_s = finished - started
+    payload = {
+        **TIMING_SCHEMA,
+        **preparation,
+        "prediction_scope": "nodes_and_edges",
+        "wall_scope": "prediction_function_to_result_ready_excluding_load_and_output",
+        "query_s": query_s,
+        "cache_policy": "reuse_current_time_context_and_node_predictions",
+        "predicted_node_count": prediction.predicted_node_count if prediction else 0,
+        "newly_predicted_node_count": (
+            prediction.newly_predicted_node_count if prediction else 0
+        ),
+        "reused_prediction_count": (
+            prediction.reused_prediction_count if prediction else 0
+        ),
+        "prediction_total_s": preparation["prepare_s"] + query_s,
         "method": "coreness_generated_edges",
         "q": q,
         "k": k,
@@ -51,10 +71,14 @@ def predict_community(predictor, q, k, t):
         "community_size": len(result.nodes),
         "edges": [list(edge) for edge in result.edges],
         "generated_edge_count": len(result.edges),
+        **result.edge_metrics(),
+        **result.core_reduction_metrics(),
         "bfs_selection_s": selected_at - started,
         "edge_generation_s": finished - selected_at,
         "elapsed_s": finished - started,
     }
+    payload["wall_s"] = time.perf_counter() - wall_start
+    return payload
 
 
 def main(argv=None):
@@ -73,10 +97,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.output and Path(args.output).exists():
         parser.error("--output already exists; choose a new result path")
+    wall_start = time.perf_counter()
     predictor, _ = _build_predictor(args)
+    load_s = time.perf_counter() - wall_start
     payload = predict_community(predictor, args.q, args.k, args.t)
     payload["slices_dir"] = str(Path(args.slices_dir).resolve())
     payload["checkpoint"] = str(Path(args.checkpoint).resolve())
+    payload["load_s"] = load_s
+    payload["wall_s"] = time.perf_counter() - wall_start
+    payload["wall_scope"] = TIMING_SCHEMA["wall_scope"]
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
         output = Path(args.output)
