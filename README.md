@@ -84,8 +84,12 @@ definitions (all durations are seconds):
 `state_update_s` and `feature_materialize_s` are components of `prepare_s`,
 not additional terms to add to it. A reused time context reports zero for those
 two components, but the preparation/cache lookup itself is still timed.
-Prediction-cache hits still incur BFS/generation work; new/reused node prediction
-counts indicate the actual inference work. Returning predictions to CPU
+Ours shares coreness predictions and merged first-order T-PPR rows across queries
+at the same time, clearing both when the time context changes.
+Prepared time-level features and history state remain shared.
+JSON identifies `cross_query_coreness_cache: true` and
+`cross_query_tppr_score_cache: true`; Zebra remains independent across queries.
+New/reused node prediction counts indicate the actual inference work. Returning predictions to CPU
 synchronizes the inference results before the BFS timer ends.
 
 Batch top-level durations are totals; `prepare_s` is charged once per queried
@@ -165,10 +169,17 @@ Scores are summed across temporal records; uncached vertices are excluded.
 The default predictor reads raw T-PPR node/score arrays in batches, without
 creating influence objects or normalizing unused weights. Merged first-order
 score rows are cached for nodes requested by edge generation at the current
-time, and reused across queries. Every query still filters those rows by its
+time, and reused across queries. Every query filters those rows by its
 own BFS set; two-hop scores and propagation state remain query-specific.
-The score cache is cleared with the time context, retains no historical rows,
+The score cache is cleared when the time context changes, retains no old-time rows,
 and uses at most O(M * top_l) entries for M distinct requested source nodes.
+Two-hop score construction and sorting are deferred until case 3 still needs
+support after checking existing edges and first-order candidates. Scores,
+ID-ordered input rows, and rankings are cached within the query and reused.
+Only first-order reverse relations are stored upfront; a core decrease expands
+them by up to two reverse hops to recover the same affected sources, without
+materializing unused two-hop scores or storing all two-hop dependencies.
+Propagation, floating-point path-sum order, and tie-breaking rules are unchanged.
 Initial row construction is included in query/edge-generation timing, not
 moved into prepare_s. Historical-neighbor and capacity-40 comparison paths
 retain their existing candidate adapters.
@@ -225,7 +236,8 @@ An edge is eligible if it appeared anywhere in snapshots `0..t`, not necessarily
 inside one of q's historical communities. Self-loops and repeated undirected
 edges are excluded. First appearances after t cannot be scored. This reduces
 decoder work but cannot recover never-before-seen future edges.
-Queries at the same time still share node encoding and historical-edge scores.
+Online `query` and `eval` queries independently recompute node encoding and
+historical-edge scores, sharing only prepared historical state.
 Progressive evaluation reports historical candidate-edge counts, not all-pairs
 counts. Result JSON identifies the full-history, historical-edges-only policy.
 
@@ -246,11 +258,59 @@ python zebra_community.py eval --device cuda:0 \
 The default MOOC paths use the converted `mooc-snapshot` data and its trained
 checkpoint in the sibling `Zebra` repository. The evaluation start is derived
 from Zebra's 85% time boundary; for the current 60-snapshot MOOC data it is
-`t=52`, predicting snapshot 53 (Zebra timestamp 54). Predicted sparse graphs
-are cached in `.zebra_cache/` using the policy version, historical-edge index,
-checkpoint, configuration, mapping files, threshold, time, and node set as
-the cache identity. Previous all-pairs graph caches and progressive results
-are not reused; existing checkpoints and experiment artifacts are preserved.
+`t=52`, predicting snapshot 53 (Zebra timestamp 54).
+
+`query` and `eval` share the online timing-v2 entry point:
+
+- `prepare_s`: update Zebra memory/T-PPR once per time slice. At the first
+  requested boundary, load a compatible history-state cache if present;
+  otherwise replay from the origin and atomically save that boundary.
+  Cache loading, validation, reconstruction and saving are included in
+  `prepare_s`. `initial_prepare_s` identifies this first preparation, not a
+  steady-state update.
+- `query_s` / `elapsed_s`: candidate-community union search, per-query node
+  encoding, historical-edge scoring and graph construction, k-core decomposition
+  and connected-community extraction. Their stage times are also reported.
+- Node embeddings and edge decisions are cleared before every query; no
+  cross-query prediction reuse is allowed (`cross_query_cache: false`).
+  Historical memory/T-PPR state remains prepared once per time slice.
+- These two commands bypass disk prediction/embedding caches, including when
+  `--cache-dir` is supplied. Existing artifacts are not removed.
+- `load_s` includes model/data loading and construction of the historical-edge
+  index. Sampling and truth-metric work are separate from prediction timing.
+  CUDA is synchronized at stage boundaries; the clock is `perf_counter`.
+- `prepare_mean_s` is total preparation / time-slice count; `query_mean_s` is
+  total query time / sample count. `incremental_prepare_mean_s` excludes the
+  first preparation. `prediction_total_s = prepare_s + query_s`, and
+  `amortized_prediction_s` divides that total by sample count. Empty averages
+  are `null`. Per-K averages and equal-K macro averages remain available.
+
+The history cache defaults to `<slices-dir>/model_cache/zebra_state/`.
+`--state-cache-dir PATH` selects another directory; `--state-cache-dir ""`
+disables it. Only the first requested boundary is saved automatically; later
+time slices advance in memory. Only an exact-boundary cache is loaded, never a
+future state. Each preparation reports `state_cache_enabled`, `state_cache_hit`,
+`state_cache_load_s` and `state_cache_save_s` (in `per_time_preparation` for eval).
+The full state includes memory vectors, last-update times, pending-message
+vectors/flags/times, all streaming T-PPR normalizers and ordered dictionaries,
+the observed timestamp and execution mode. Query embeddings, predicted edges,
+model weights and unused validation T-PPR copies are not stored.
+Cache identities include the checkpoint, configuration, replay batch size,
+mapping, replay data, edge features, implementation and runtime/device.
+Invalid/corrupt caches emit a warning, reset history and are rebuilt by replay.
+The cache uses tensor/primitive serialization, not pickled Numba objects.
+Use only trusted locally generated cache files: older supported PyTorch versions
+do not provide the restricted `weights_only` loader.
+
+For Hybrid comparisons, use identical samples, time/query order, hardware and
+thread settings. Compare steady-state updates separately from initialization;
+warm-cache comparisons require both initial caches to exist before timing.
+The September 14 `hybrid_zebra_timing_20260914_n12lr0` experiment predates this
+Zebra state cache: its Zebra preparation includes a full initial replay and
+must not be presented as a cache-hit result.
+The retained `progressive-eval` is a legacy cached-embedding workflow and is
+explicitly marked unsuitable for online timing comparisons. Low-level
+`predict_graph` still supports its existing disk cache for non-timing callers.
 
 ## Methods
 

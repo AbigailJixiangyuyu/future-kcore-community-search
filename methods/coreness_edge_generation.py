@@ -41,6 +41,48 @@ class PredictedEdgeResult:
         }
 
 
+class _LazySecondScores:
+    """Query-local two-hop scores, materialized only for requested sources."""
+
+    def __init__(self, direct):
+        self.direct = direct
+        self.ordered = {}
+        self.cache = {}
+
+    def _ordered_row(self, node):
+        if node not in self.ordered:
+            # Preserve the eager implementation's floating-point sum order.
+            self.ordered[node] = tuple(sorted(self.direct[node].items()))
+        return self.ordered[node]
+
+    def __getitem__(self, node):
+        if node not in self.cache:
+            paths = {}
+            for middle, first_score in self._ordered_row(node):
+                for candidate, score in self._ordered_row(middle):
+                    if candidate != node:
+                        paths[candidate] = paths.get(candidate, 0.0) + first_score * score
+            self.cache[node] = paths
+        return self.cache[node]
+
+
+class _ReverseCandidateDependencies:
+    """Expand one/two-hop reverse dependencies on demand, without score rows."""
+
+    def __init__(self, direct):
+        self.reverse = {v: set() for v in direct}
+        for source, candidates in direct.items():
+            for candidate in candidates:
+                self.reverse[candidate].add(source)
+
+    def __getitem__(self, node):
+        affected = set(self.reverse[node])
+        for middle in self.reverse[node]:
+            affected.update(self.reverse[middle])
+        affected.discard(node)
+        return affected
+
+
 def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k,
                              *, scores_for_node=None):
     """Use cached raw T-PPR candidates inside the fixed BFS node set.
@@ -74,17 +116,7 @@ def generate_predicted_edges(nodes, predicted_coreness, influences_for_node, k,
             if candidate in nodes and candidate != node:
                 scores[candidate] = scores.get(candidate, 0.0) + influence.score
         direct[node] = scores
-    # Reuse ID-ordered rows without changing the order of floating-point sums.
-    ordered_direct = {node: tuple(sorted(scores.items()))
-                      for node, scores in direct.items()}
-    second = {}
-    for node, scores in direct.items():
-        paths = {}
-        for middle, first_score in ordered_direct[node]:
-            for candidate, score in ordered_direct[middle]:
-                if candidate != node:
-                    paths[candidate] = paths.get(candidate, 0.0) + first_score * score
-        second[node] = paths
+    second = _LazySecondScores(direct)
     engine = _ImmediateEdgePropagation(
         {node: int(predicted_coreness[node]) for node in nodes}, direct, second, k
     )
@@ -108,15 +140,21 @@ class _ImmediateEdgePropagation:
         self.owners = {v: set() for v in effective}
         self.adjacency = {v: set() for v in effective}
         self.edge_cases = {}
-        self.dependents = {v: set() for v in effective}
+        if isinstance(second, _LazySecondScores):
+            self.dependents = _ReverseCandidateDependencies(direct)
+        else:
+            # Explicit candidate tables used by low-level callers may differ
+            # from the two-hop closure; preserve their exact dependencies.
+            self.dependents = {v: set() for v in effective}
+            for source in effective:
+                for candidate in set(direct[source]) | set(second[source]):
+                    self.dependents[candidate].add(source)
         self.rankings = {}
         for source in effective:
             self.rankings[source] = (
                 sorted(direct[source], key=lambda v: (-direct[source][v], v)),
-                sorted(second[source], key=lambda v: (-second[source][v], v)),
+                None,
             )
-            for candidate in set(direct[source]) | set(second[source]):
-                self.dependents[candidate].add(source)
         self.visited = set()
         self.process_counts = {v: 0 for v in effective}
         self.core_updates = []
@@ -125,6 +163,15 @@ class _ImmediateEdgePropagation:
         self.sequence = 0
         for node in sorted(effective):
             self._enqueue(node, urgent=False)
+
+    def _second_ranking(self, node):
+        """Sort only when case 3 reaches two-hop candidates; reuse on revisits."""
+        direct, second = self.rankings[node]
+        if second is None:
+            scores = self.second[node]
+            second = sorted(scores, key=lambda v: (-scores[v], v))
+            self.rankings[node] = (direct, second)
+        return second
 
     def _enqueue(self, node, urgent):
         priority = 0 if urgent else 1
@@ -208,7 +255,11 @@ class _ImmediateEdgePropagation:
         # No other node is processed during this call. Each added edge below is
         # new and eligible, so its contribution is exactly one until we yield.
         support = self._support_count(node)
-        for ranked in self.rankings[node]:
+        for order in range(2):
+            if support >= core:
+                return
+            ranked = (self.rankings[node][0] if order == 0
+                      else self._second_ranking(node))
             for candidate in ranked:
                 if support >= core:
                     return

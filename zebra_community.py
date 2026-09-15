@@ -24,6 +24,7 @@ from datasets.community_eval_builder import (
     set_metrics,
 )
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
+from methods.zebra_history_cache import ZebraHistoryCache
 
 
 ROOT = Path(__file__).resolve().parent
@@ -52,6 +53,96 @@ COMMUNITY_METRICS = (
     "pred_ratio",
     "elapsed_s",
 )
+TIMING_SCHEMA = {
+    "timing_version": 2,
+    "timing_clock": "perf_counter",
+    "elapsed_scope": "candidate_search_encoding_edge_prediction_and_community",
+    "prediction_total_scope": "prepare_plus_query_excluding_load_and_evaluation",
+    "wall_scope": "entry_to_result_ready_excluding_serialization_and_output",
+    "prediction_disk_cache": False,
+    "cross_query_cache": False,
+    "initial_state_policy": "load_exact_boundary_cache_else_replay_and_save",
+}
+
+
+class TimedZebraSession:
+    """Independent queries over shared, prepared historical state."""
+
+    def __init__(self, predictor):
+        self.predictor = predictor
+        self.t = None
+
+    def now(self):
+        device = torch.device(self.predictor.zebra.device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    def prepare(self, t):
+        predictor = self.predictor
+        if not 0 <= t < len(predictor.snapshots) - 1:
+            raise IndexError("prediction requires both t and t+1 snapshots")
+        started = self.now()
+        reused = t == self.t
+        initial = self.t is None
+        cache_hit = False
+        cache = getattr(predictor, "history_cache", None)
+        cache_load_s = 0.0
+        cache_save_s = 0.0
+        if not reused:
+            # Persist only the first requested boundary, not every incremental slice.
+            if initial and cache is not None:
+                cache_started = self.now()
+                cache_hit = cache.load(t)
+                cache_load_s = self.now() - cache_started
+            if not cache_hit:
+                predictor.zebra.replay_until(predictor.time_to_zebra[t])
+                if initial and cache is not None:
+                    cache_started = self.now()
+                    cache.save(t)
+                    cache_save_s = self.now() - cache_started
+            self.t = t
+        elapsed = self.now() - started
+        return {
+            "t": t, "prepare_s": elapsed,
+            "state_update_s": 0.0 if reused else elapsed,
+            "context_cache_hit": reused, "initial_prepare": initial,
+            "state_cache_enabled": cache is not None,
+            "state_cache_hit": cache_hit,
+            "state_cache_load_s": cache_load_s,
+            "state_cache_save_s": cache_save_s,
+        }
+
+    def query(self, q, k, t):
+        if t != self.t:
+            raise ValueError("prepare the requested time before querying")
+        predictor = self.predictor
+        started = self.now()
+        candidate = predictor.candidate(q, k, t)
+        nodes = np.asarray(sorted(candidate), dtype=np.int64)
+        candidate_end = self.now()
+        if len(nodes):
+            embeddings = predictor.zebra.encode_nodes(
+                predictor._mapped_nodes(nodes), predictor.time_to_zebra[t + 1]
+            )
+        encode_end = self.now()
+        if len(nodes):
+            graph = predictor._decode_graph(nodes, embeddings, t)
+        else:
+            graph = PredictedGraph(nodes, sparse.csr_matrix((0, 0), dtype=np.bool_))
+        graph_end = self.now()
+        community = graph.community(candidate, q, k)
+        ended = self.now()
+        return community, graph, {
+            "candidate_size": len(candidate),
+            "newly_encoded_node_count": len(nodes),
+            "candidate_search_s": candidate_end - started,
+            "node_encoding_s": encode_end - candidate_end,
+            "edge_prediction_s": graph_end - encode_end,
+            "community_search_s": ended - graph_end,
+            "query_s": ended - started,
+            "elapsed_s": ended - started,
+        }
 
 # Networkit 11.0.1 still looks up this NumPy alias when bulk-loading COO edges.
 if "ulong" not in np.__dict__:
@@ -517,7 +608,7 @@ class ZebraCommunityPredictor:
         )
 
     def _decode_graph(self, original_nodes, embeddings, t,
-                      progress_callback=None):
+                      progress_callback=None, edge_decisions=None):
         total_pairs = self.edge_index.count(original_nodes, t)
         if total_pairs == 0:
             if progress_callback is not None:
@@ -527,24 +618,40 @@ class ZebraCommunityPredictor:
             )
             return PredictedGraph(original_nodes, adjacency)
 
-        projected_decoder = _build_projected_decoder(self.zebra, embeddings)
+        projected_decoder = None
+        decoder_initialized = False
         edge_left = []
         edge_right = []
         completed_pairs = 0
         for left, right in self.edge_index.batches(
             original_nodes, t, self.pair_batch_size
         ):
-            left_index = torch.from_numpy(left).long().to(self.zebra.device)
-            right_index = torch.from_numpy(right).long().to(self.zebra.device)
-            if projected_decoder is None:
-                probabilities = self.zebra.score_undirected_embeddings(
-                    embeddings[left_index], embeddings[right_index]
-                )
-            else:
-                probabilities = projected_decoder.score(
-                    left_index, right_index
-                )
-            selected = probabilities.gt(self.threshold).cpu().numpy()
+            keys = [
+                (int(original_nodes[u]), int(original_nodes[v]))
+                for u, v in zip(left, right)
+            ] if edge_decisions is not None else None
+            missing = np.asarray([
+                i for i, key in enumerate(keys) if key not in edge_decisions
+            ], dtype=np.int64) if keys is not None else np.arange(len(left))
+            selected = np.zeros(len(left), dtype=np.bool_)
+            if len(missing):
+                if not decoder_initialized:
+                    projected_decoder = _build_projected_decoder(self.zebra, embeddings)
+                    decoder_initialized = True
+                left_index = torch.from_numpy(left[missing]).long().to(self.zebra.device)
+                right_index = torch.from_numpy(right[missing]).long().to(self.zebra.device)
+                if projected_decoder is None:
+                    probabilities = self.zebra.score_undirected_embeddings(
+                        embeddings[left_index], embeddings[right_index]
+                    )
+                else:
+                    probabilities = projected_decoder.score(left_index, right_index)
+                selected[missing] = probabilities.gt(self.threshold).cpu().numpy()
+                if keys is not None:
+                    for i in missing:
+                        edge_decisions[keys[i]] = bool(selected[i])
+            if keys is not None:
+                selected = np.asarray([edge_decisions[key] for key in keys], dtype=np.bool_)
             if selected.any():
                 edge_left.append(left[selected].astype(np.int32, copy=False))
                 edge_right.append(right[selected].astype(np.int32, copy=False))
@@ -635,26 +742,38 @@ def _build_predictor(args):
         pair_batch_size=args.pair_batch_size,
         cache_dir=args.cache_dir,
     )
+    state_cache_dir = getattr(args, "state_cache_dir", None)
+    if state_cache_dir is None:
+        state_cache_dir = slices_dir / "model_cache" / "zebra_state"
+    predictor.history_cache = (
+        ZebraHistoryCache(predictor, state_cache_dir, args.zebra_root)
+        if state_cache_dir else None
+    )
     return predictor, total_nodes
 
 
 def _query(args):
+    wall_start = time.perf_counter()
     predictor, _ = _build_predictor(args)
-    candidate = predictor.candidate(args.q, args.k, args.t)
-    started = time.time()
-    graph = predictor.predict_graph(candidate, args.t)
-    community = graph.community(candidate, args.q, args.k)
+    session = TimedZebraSession(predictor)
+    load_s = session.now() - wall_start
+    preparation = session.prepare(args.t)
+    community, graph, timing = session.query(args.q, args.k, args.t)
     result = {
         "q": args.q,
         "k": args.k,
         "t": args.t,
-        "candidate_size": len(candidate),
+        **TIMING_SCHEMA,
+        **preparation,
+        **timing,
+        "load_s": load_s,
+        "prediction_total_s": preparation["prepare_s"] + timing["query_s"],
         **predictor.candidate_metadata,
         "predicted_edge_count": graph.edge_count,
         "community_size": len(community),
         "community": sorted(community),
-        "elapsed_s": time.time() - started,
     }
+    result["wall_s"] = session.now() - wall_start
     print(json.dumps(result, ensure_ascii=True))
 
 
@@ -766,6 +885,9 @@ def _build_progress_payload(dataset_name, predictor, samples, records,
         }
     return {
         "version": PROGRESSIVE_RESULT_VERSION,
+        "timing_version": 1,
+        "timing_comparison_eligible": False,
+        "timing_note": "Legacy cached-embedding workflow; use eval for online timing.",
         "dataset": dataset_name,
         "run_signature": run_signature,
         "checkpoint": str(Path(predictor.zebra.checkpoint_path).resolve()),
@@ -1124,7 +1246,11 @@ def _progressive_status(args):
 
 
 def _evaluate(args):
+    wall_start = time.perf_counter()
     predictor, total_nodes = _build_predictor(args)
+    session = TimedZebraSession(predictor)
+    load_s = session.now() - wall_start
+    sample_started = time.perf_counter()
     manifest = load_time_slice_manifest(args.slices_dir)
     dataset_name = manifest["dataset"]
     start_t = predictor.test_start_t if args.start_t is None else args.start_t
@@ -1144,69 +1270,96 @@ def _evaluate(args):
 
     samples_by_t = defaultdict(list)
     for sample in samples:
-        sample["candidate"] = predictor.candidate(
-            sample["query"], sample["k"], sample["t"]
-        )
         samples_by_t[sample["t"]].append(sample)
 
     rows = defaultdict(list)
-    wall_start = time.time()
+    sample_prepare_s = time.perf_counter() - sample_started
+    preparations = []
+    query_total = 0.0
+    metric_s = 0.0
+    candidate_sizes = []
     for t, time_samples in sorted(samples_by_t.items()):
-        union_nodes = set().union(
-            *(sample["candidate"] for sample in time_samples)
-        )
-        graph_start = time.time()
-        graph = predictor.predict_graph(union_nodes, t)
-        graph_elapsed = time.time() - graph_start
-        print(
-            "t={} samples={} nodes={} edges={} graph_s={:.3f}".format(
-                t, len(time_samples), len(union_nodes), graph.edge_count,
-                graph_elapsed,
-            ),
-            flush=True,
-        )
+        preparation = session.prepare(t)
+        preparations.append(preparation)
+        time_query_s = 0.0
         for sample in time_samples:
-            started = time.time()
-            prediction = graph.community(
-                sample["candidate"], sample["query"], sample["k"]
+            prediction, graph, timing = session.query(
+                sample["query"], sample["k"], t
             )
+            time_query_s += timing["query_s"]
+            candidate_sizes.append(timing["candidate_size"])
+            metric_started = time.perf_counter()
             metrics = set_metrics(prediction, sample["community"])
             rows[sample["k"]].append({
                 **metrics,
+                **timing,
                 "size_ratio": len(prediction) / len(sample["community"]),
                 "pred_ratio": len(prediction) / total_nodes * 100,
-                "elapsed_s": time.time() - started,
             })
+            metric_s += time.perf_counter() - metric_started
+        query_total += time_query_s
+        print(
+            "t={} samples={} prepare_s={:.3f} query_s={:.3f}".format(
+                t, len(time_samples), preparation["prepare_s"], time_query_s
+            ), flush=True,
+        )
 
     per_k = _aggregate(rows)
+    timing_names = (
+        "query_s", "candidate_search_s", "node_encoding_s",
+        "edge_prediction_s", "community_search_s",
+    )
+    for k, values in rows.items():
+        per_k[k].update({
+            name: float(np.mean([row[name] for row in values]))
+            for name in timing_names
+        })
     macro = {}
     if per_k:
         for name in (
             "precision", "recall", "f1", "jaccard",
             "size_ratio", "pred_ratio", "elapsed_s",
-        ):
+        ) + timing_names:
             macro[name] = float(np.mean([
                 result[name] for result in per_k.values()
             ]))
     result = {
+        **TIMING_SCHEMA,
         "dataset": dataset_name,
         "start_t": start_t,
         "threshold": predictor.threshold,
         **predictor.candidate_metadata,
         "samples": len(samples),
-        "candidate_size_mean": float(np.mean([
-            len(sample["candidate"]) for sample in samples
-        ])) if samples else 0.0,
-        "candidate_size_max": max(
-            (len(sample["candidate"]) for sample in samples), default=0
-        ),
+        "candidate_size_mean": float(np.mean(candidate_sizes)) if samples else 0.0,
+        "candidate_size_max": max(candidate_sizes, default=0),
         "query_set_sha256": hashlib.sha256(json.dumps(sorted(
             (int(s["query"]), int(s["k"]), int(s["t"])) for s in samples
         )).encode("ascii")).hexdigest(),
         "per_k": per_k,
         "macro": macro,
-        "wall_s": time.time() - wall_start,
+        "load_s": load_s,
+        "sample_prepare_s": sample_prepare_s,
+        "metric_s": metric_s,
+        "prepare_s": sum(row["prepare_s"] for row in preparations),
+        "query_s": query_total,
+        "elapsed_s": query_total,
+        "prepared_time_count": len(preparations),
+        "per_time_preparation": preparations,
+        "initial_prepare_s": preparations[0]["prepare_s"] if preparations else 0.0,
     }
+    result["prediction_total_s"] = result["prepare_s"] + query_total
+    result["prepare_mean_s"] = (
+        result["prepare_s"] / len(preparations) if preparations else None
+    )
+    result["incremental_prepare_mean_s"] = (
+        sum(row["prepare_s"] for row in preparations[1:]) / (len(preparations) - 1)
+        if len(preparations) > 1 else None
+    )
+    result["query_mean_s"] = query_total / len(samples) if samples else None
+    result["amortized_prediction_s"] = (
+        result["prediction_total_s"] / len(samples) if samples else None
+    )
+    result["wall_s"] = session.now() - wall_start
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.output:
         output_path = Path(args.output)
@@ -1226,6 +1379,11 @@ def _add_common_arguments(parser):
     )
     parser.add_argument(
         "--cache-dir", default=str(ROOT / ".zebra_cache")
+    )
+    parser.add_argument(
+        "--state-cache-dir", default=None,
+        help="Initial history-state cache for query/eval; default: "
+             "<slices-dir>/model_cache/zebra_state. Pass an empty string to disable.",
     )
 
 

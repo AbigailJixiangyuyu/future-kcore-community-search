@@ -42,6 +42,9 @@ DEFAULT_BATCH_SIZE = 512
 EVALUATION_KS = (3, 4, 5, 6, 7)
 STATE_CACHE_VERSION = 1
 TIMING_SCHEMA = {
+    "cross_query_cache": True,
+    "cross_query_coreness_cache": True,
+    "cross_query_tppr_score_cache": True,
     "timing_version": 2,
     "timing_clock": "perf_counter",
     "elapsed_scope": "bfs_and_inference_plus_edge_generation",
@@ -478,7 +481,7 @@ class HybridCommunityPredictor:
         )
 
     def predict(self, q, k, t, context=None):
-        """Predict one community using the query time's node cache."""
+        """Reuse current-time coreness predictions and merged T-PPR rows."""
         if not isinstance(k, int) or k <= 0:
             raise ValueError("k must be a positive integer")
         if k > self.model.kmax:
@@ -872,7 +875,7 @@ def _evaluate(args, *, predictor_builder=None, metadata=None):
         **(metadata or {}),
         **TIMING_SCHEMA,
         "prediction_scope": "nodes_and_edges",
-        "cache_policy": "shared_per_time_in_sample_order",
+        "cache_policy": "shared_time_features_coreness_and_tppr_scores",
         "load_s": load_s,
         "sample_prepare_s": sample_prepare_s,
         "metric_s": metric_s,
