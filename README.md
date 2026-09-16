@@ -203,8 +203,9 @@ It returns these nodes and edges
 directly, without k-core peeling, further connectivity filtering, or removing
 isolates. Edge generation reuses the BFS predictions, not global inference.
 It does not change the existing hybrid threshold-BFS command.
-See [edge generation rules](docs/生成边.md).
-See the [MOOC/email T-PPR capacity 20 vs 40 report](docs/tppr-capacity20-vs40-mooc-email-20260910.md)
+See the [Ours workflow](docs/ours-community-prediction-workflow.md)
+and [archived edge generation rules](docs/archive/生成边.md).
+See the [archived MOOC/email T-PPR capacity 20 vs 40 report](docs/archive/tppr-capacity20-vs40-mooc-email-20260910.md)
 for full evaluation results, per-K metrics, lowering ratios, and timing tradeoffs.
 
 ```bash
@@ -512,7 +513,7 @@ Snapshots, test samples, and persisted evaluation sets are cached inside the
 specific `time_slices/step_<step>_window_<window>/` directory that produced them.
 
 The Hybrid and Zebra comparison on MOOC and WikiTalk is documented in
-[`docs/community-evaluation-results.md`](docs/community-evaluation-results.md).
+the [archived community evaluation report](docs/archive/community-evaluation-results.md).
 
 ## Data Format
 

@@ -39,3 +39,6 @@ wandb/
 .zebra_embedding_cache/
 
 run_logs/
+
+# Recoverable local archives of historical experiment artifacts
+/archive/experiment-artifacts/
