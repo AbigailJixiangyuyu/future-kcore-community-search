@@ -34,8 +34,9 @@ coreness-prediction/
 │               ├── sample_cache/    # Cached test samples
 │               └── community_eval/  # Persisted evaluation set (optional)
 ├── archive/streaming_tcs/         # Retired StreamingTCS code and evaluator
-├── docs/                          # Project documentation
-└── specs/                         # Change specifications and archives
+├── archive/analysis/             # Historical standalone analysis tools
+├── archive/specs/                # Historical change specifications (archived)
+└── docs/                          # Project documentation
 ```
 
 ## Active Methods

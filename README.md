@@ -178,7 +178,7 @@ for full evaluation results, per-K metrics, lowering ratios, and timing tradeoff
 ```bash
 python generated_edge_community.py 413 7 52 \
   --slices-dir data/mooc/time_slices/step_43200_window_86400 \
-  --checkpoint results/fusion_ablation_20260907/mooc/concat.pt \
+  --checkpoint results/current_snapshot_training_20260914_4ymmR4/mooc.pt \
   --device cuda:0 \
   --output results/generated_edges/mooc_q413_k7_t52.json
 ```
@@ -450,7 +450,10 @@ The tied decoder, output-head selector and dedicated comparison scripts have
 been removed. Checkpoints must explicitly declare `output_head_type="linear"`;
 tied checkpoints and missing output-head metadata are rejected. Existing default
 checkpoint files are not automatically replaced. Compatible local models are
-`results/fusion_ablation_20260907/{email,mooc}/concat.pt`.
+`results/current_snapshot_training_20260914_4ymmR4/{email,mooc}.pt`.
+The older fusion-ablation and Wiki checkpoints use retired feature semantics
+and have been moved to the local ignored artifact archive; they cannot be
+loaded by the current predictor.
 See [historical output-head results](docs/archive/model-experiments/output-head-ablation-results.md);
 archived commands describe retired versions, not the current code.
 
@@ -553,5 +556,7 @@ data/
         sample_cache/           # Derived test samples
         community_eval/         # Optional persisted evaluation set
 archive/
+  analysis/                     # Historical edge-coverage analysis tool
   streaming_tcs/                # Retired StreamingTCS implementation and evaluator
+  specs/                        # Archived historical change specifications
 ```

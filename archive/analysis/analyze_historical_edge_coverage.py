@@ -125,7 +125,7 @@ def main():
         help="Uses full existing sample caches, not the wiki 1/6 subset.",
     )
     args = parser.parse_args()
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for dataset in args.datasets:
         slices = datasets[dataset]
