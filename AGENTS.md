@@ -6,8 +6,9 @@ the next snapshot.
 
 ## Tech Stack
 
-Python 3, networkit, NumPy, PyTorch. Numba and multiprocessing are retained only
-by the archived StreamingTCS experiment.
+Python 3, networkit, NumPy, PyTorch. Numba accelerates the active T-PPR
+implementation and is also used by the archived StreamingTCS experiment.
+Multiprocessing is retained by the archived StreamingTCS evaluator.
 
 ## Directory Structure
 

@@ -122,42 +122,9 @@ nonempty but edgeless communities are included. Per-K query means and valid-K
 macro means use this independent valid set, audited by `core_ratio_valid_samples`,
 `core_ratio_empty_samples`, and cumulative `case3_lowered_node_count`.
 
-For the independent historical-neighbor candidate ablation, use
-`historical_neighbor_community.py query ...` or `eval`. It preserves the model,
-BFS and propagation rules but sets N(v) to historical direct neighbors through t
-inside the BFS set. Cached raw T-PPR scores are summed by vertex; missing scores
-are zero, with node-ID tie-breaking. Two-hop candidates use these historical
-neighbor sets (and may introduce nonhistorical edges). This is not guaranteed to
-be a superset of the original T-PPR candidates. The default method is unchanged.
-
-```bash
-python historical_neighbor_community.py eval \
-  --slices-dir data/mooc/time_slices/step_43200_window_86400 \
-  --checkpoint results/fusion_ablation_20260907/mooc/concat.pt \
-  --start-t 52 --device cuda:0 \
-  --output results/mooc_historical_neighbors.json
-```
-
-The comparison script rejects existing output paths and reports the same
-per-K/macro metrics, including case-3 lowered-node ratios. F1/Jaccard should
-remain unchanged because the selected node set is unchanged; compare edge
-composition, lowering and runtime, not node accuracy, to assess this ablation.
-
-`tppr40_community.py` offers the same `query` / `eval` CLI for a different ablation:
-the shared T-PPR state maintains 40 temporal records, model features still read
-Top-20, and edge candidates read all Top-40. It uses the existing model without
-retraining and isolates state caches under `tppr40_model20`. Unlike the
-historical-neighbor-only change, the wider maintained state can change the model's
-Top-20 inputs, predicted coreness and BFS node sets; compare F1/Jaccard as well as
-lowering ratios. Forty temporal records do not guarantee forty distinct vertices.
-
-```bash
-python tppr40_community.py eval \
-  --slices-dir data/mooc/time_slices/step_43200_window_86400 \
-  --checkpoint results/fusion_ablation_20260907/mooc/concat.pt \
-  --start-t 52 --device cuda:0 \
-  --output results/mooc_tppr40.json
-```
+The historical-neighbor and T-PPR capacity-40 ablation entry points were
+removed on 2026-09-16. Historical reports remain in `docs/archive/`;
+their retired commands are not supported by the current code.
 
 The independent `generated_edge_community.py` script first selects nodes by
 q-rooted BFS through nodes with predicted coreness >= k on the full historical
@@ -242,10 +209,9 @@ historical-edge scores, sharing only prepared historical state.
 Progressive evaluation reports historical candidate-edge counts, not all-pairs
 counts. Result JSON identifies the full-history, historical-edges-only policy.
 
-The previous sliding-window/all-pairs implementation is preserved unchanged as
-`zebra_community_rho_backup.py`. Run it with the same arguments as before,
-including `--candidate-window-rho 0.2`, to reproduce the rho experiments.
-The historical email rho runner uses this backup, not the active implementation.
+The previous sliding-window/all-pairs Zebra implementation and its email rho
+runner were removed on 2026-09-16. The rho experiment report remains in
+`docs/archive/` as a historical record, not a runnable current protocol.
 
 ```bash
 # t is the zero-based coreness snapshot index
