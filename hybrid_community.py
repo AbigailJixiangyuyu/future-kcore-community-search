@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ from datasets.coreness_prediction_builder import (
     prepare_inference_feature_table,
 )
 from datasets.dataset_builder import load_time_slice_manifest
+from datasets.indexed_slices import logical_slice_identity
 from datasets.snapshot_store import open_snapshot_store, SnapshotStore
 from methods.hybrid_coreness import (
     LayeredCommunityResult,
@@ -167,6 +169,7 @@ class HybridCommunityPredictor:
     def _state_cache_metadata(self, t):
         return {
             "version": STATE_CACHE_VERSION,
+            "numeric_dtype": "float32",
             "identity": self.state_cache_identity,
             "time": int(t),
             "snapshot_count": len(self.snapshots),
@@ -253,7 +256,7 @@ class HybridCommunityPredictor:
             ], dtype=np.int32)
         else:
             sparse_penalties = np.empty(
-                (0, self.model.kmax), dtype=np.float64
+                (0, self.model.kmax), dtype=np.float32
             )
             sparse_times = np.empty(0, dtype=np.int32)
 
@@ -277,7 +280,7 @@ class HybridCommunityPredictor:
                     tcs_rows=tcs_rows,
                     tcs_penalties=self.tcs_index._penalties[tcs_rows],
                     tcs_times=self.tcs_index._last_times[tcs_rows],
-                    tcs_weight_sum=np.asarray(self.tcs_index.weight_sum),
+                    tcs_weight_sum=np.asarray(self.tcs_index.weight_sum, dtype=np.float32),
                     tcs_sparse_nodes=sparse_nodes,
                     tcs_sparse_penalties=sparse_penalties,
                     tcs_sparse_times=sparse_times,
@@ -341,7 +344,7 @@ class HybridCommunityPredictor:
                     cached["tcs_sparse_times"],
                 )
             }
-            self.tcs_index.weight_sum = float(cached["tcs_weight_sum"].item())
+            self.tcs_index.weight_sum = np.float32(cached["tcs_weight_sum"].item())
             self.tcs_index.current_time = cache_time
         self._current_time = cache_time
         return cache_time
@@ -536,16 +539,23 @@ def _resolve_checkpoint_path(slices_dir, checkpoint):
 
 
 def _state_cache_identity(slices_dir):
-    """Fingerprint the immutable inputs that define a streaming state."""
+    """Fingerprint data/feature semantics, not the physical storage layout.
+
+    The versioned prefix deliberately rejects old metadata-bytes-only keys:
+    they did not certify window content and cannot safely be auto-aliased.
+    """
     slices_dir = Path(slices_dir)
-    digest = hashlib.sha256()
-    for path in (
-        slices_dir / "metadata.json",
-        slices_dir / "snapshot_cache" / "metadata.json",
-    ):
-        digest.update(path.name.encode("ascii"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+    manifest = load_time_slice_manifest(slices_dir)
+    metadata = json.loads(
+        (slices_dir / "snapshot_cache" / "metadata.json").read_text()
+    )
+    payload = {
+        "version": "hybrid_state_inputs_v2",
+        "windows": logical_slice_identity(slices_dir, manifest),
+        "snapshot_features": metadata,
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "v2:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _build_predictor(args):
@@ -556,6 +566,11 @@ def _build_predictor(args):
     model, checkpoint = load_hybrid_coreness_model(
         checkpoint_path, device=device
     )
+    if checkpoint.get("feature_config", {}).get("numeric_dtype") != "float32":
+        warnings.warn(
+            "This checkpoint predates float32 T-PPR/TCS computation. It remains "
+            "loadable, but predictions must be re-evaluated with the new inputs."
+        )
     if model.kmax != kmax:
         raise ValueError(
             "checkpoint kmax {} does not match snapshot kmax {}".format(
@@ -652,7 +667,7 @@ def _aggregate(rows):
     )
     for k, values in sorted(rows.items()):
         result[k] = {
-            name: float(np.mean([row[name] for row in values]))
+            name: float(np.mean([row[name] for row in values], dtype=np.float32))
             for name in metric_names
         }
         result[k]["samples"] = len(values)
@@ -665,7 +680,7 @@ def _aggregate(rows):
             row["case3_lowered_node_count"] for row in values
         )
         result[k]["case3_lowered_node_ratio"] = (
-            float(np.mean([row["case3_lowered_node_ratio"] for row in lowered_valid]))
+            float(np.mean([row["case3_lowered_node_ratio"] for row in lowered_valid], dtype=np.float32))
             if lowered_valid else None
         )
         valid = [row for row in values if row["edge_case1_ratio"] is not None]
@@ -676,7 +691,7 @@ def _aggregate(rows):
                 row[f"edge_case{i}_count"] for row in values
             )
             result[k][f"edge_case{i}_ratio"] = (
-                float(np.mean([row[f"edge_case{i}_ratio"] for row in valid]))
+                float(np.mean([row[f"edge_case{i}_ratio"] for row in valid], dtype=np.float32))
                 if valid else None
             )
     return result
@@ -695,7 +710,7 @@ def _edge_aggregate_summary(per_k):
     lowered_valid = [row for row in per_k.values()
                      if row["core_ratio_valid_samples"] > 0]
     summary["case3_lowered_node_ratio"] = (
-        float(np.mean([row["case3_lowered_node_ratio"] for row in lowered_valid]))
+        float(np.mean([row["case3_lowered_node_ratio"] for row in lowered_valid], dtype=np.float32))
         if lowered_valid else None
     )
     valid = [row for row in per_k.values()
@@ -705,7 +720,7 @@ def _edge_aggregate_summary(per_k):
             row[f"edge_case{i}_count"] for row in per_k.values()
         )
         summary[f"edge_case{i}_ratio"] = (
-            float(np.mean([row[f"edge_case{i}_ratio"] for row in valid]))
+            float(np.mean([row[f"edge_case{i}_ratio"] for row in valid], dtype=np.float32))
             if valid else None
         )
     return summary
@@ -867,7 +882,7 @@ def _evaluate(args, *, predictor_builder=None, metadata=None):
         ):
             macro[name] = float(np.mean([
                 result[name] for result in per_k.values()
-            ]))
+            ], dtype=np.float32))
     edge_summary = _edge_aggregate_summary(per_k)
     macro.update({name: value for name, value in edge_summary.items()
                   if name.endswith("_ratio")})

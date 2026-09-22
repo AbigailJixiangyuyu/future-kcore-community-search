@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 
-VERSION = 1
+VERSION = 2
 MEMORY_FIELDS = ("memory", "last_update", "messages", "timestamps")
 
 
@@ -91,12 +91,12 @@ class ZebraHistoryCache:
         memory = model.memory
         finder = model.embedding_module.tppr_finder
         return {
-            "memory": {name: getattr(memory, name).detach().cpu().clone()
+            "memory": {name: getattr(memory, name).detach().cpu().float().clone()
                        for name in MEMORY_FIELDS},
             "nodes": torch.from_numpy(memory.nodes.copy()),
-            "norms": [torch.from_numpy(row.copy()) for row in finder.norm_list],
+            "norms": [torch.from_numpy(row.astype(np.float32)) for row in finder.norm_list],
             "ppr": [
-                [[(int(key[0]), int(key[1]), float(key[2]), float(weight))
+                [[(int(key[0]), int(key[1]), float(key[2]), float(np.float32(weight)))
                   for key, weight in row.items()] for row in group]
                 for group in finder.PPR_list
             ],
@@ -117,7 +117,7 @@ class ZebraHistoryCache:
         for name in MEMORY_FIELDS:
             tensor = state["memory"][name]
             current = getattr(memory, name)
-            if tensor.shape != current.shape or tensor.dtype != current.dtype:
+            if tensor.shape != current.shape or tensor.dtype != torch.float32:
                 raise ValueError(f"incompatible memory field: {name}")
             if not torch.isfinite(tensor).all():
                 raise ValueError("non-finite cached memory")
@@ -126,7 +126,7 @@ class ZebraHistoryCache:
         if len(state["norms"]) != finder.n_tppr or len(state["ppr"]) != finder.n_tppr:
             raise ValueError("incompatible T-PPR ensemble")
         for norm, group in zip(state["norms"], state["ppr"]):
-            if norm.shape != (finder.num_nodes,) or norm.dtype != torch.float64:
+            if norm.shape != (finder.num_nodes,) or norm.dtype != torch.float32:
                 raise ValueError("incompatible T-PPR normalization")
             if not torch.isfinite(norm).all() or len(group) != finder.num_nodes:
                 raise ValueError("invalid T-PPR state")
@@ -147,7 +147,10 @@ class ZebraHistoryCache:
                 for edge, neighbor, timestamp, weight in entries:
                     row[(edge, neighbor, timestamp)] = weight
         for name in MEMORY_FIELDS:
-            setattr(memory, name, state["memory"][name].to(z.device).clone())
+            current = getattr(memory, name)
+            setattr(memory, name, state["memory"][name].to(
+                device=z.device, dtype=current.dtype
+            ).clone())
         memory.nodes = state["nodes"].numpy().copy()
         model.test_mode = state["test_mode"]
         model.batch_counter = state["batch_counter"]

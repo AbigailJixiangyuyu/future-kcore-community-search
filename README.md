@@ -31,9 +31,9 @@ reading and writing; explicit `build-state-cache` keeps control of its output.
 
 ```bash
 python hybrid_community.py build-state-cache \
-  --slices-dir data/wiki-talk-temporal/time_slices/step_259200_window_604800 \
-  --checkpoint data/wiki-talk-temporal/time_slices/step_259200_window_604800/model_cache/hybrid_coreness.pt \
-  --device cpu --time 343
+  --slices-dir data/mooc/time_slices/step_43200_window_86400 \
+  --checkpoint results/current_snapshot_training_20260914_4ymmR4/mooc.pt \
+  --device cpu --time 52
 ```
 
 ### Coreness-guided edge generation
@@ -304,7 +304,7 @@ uses only snapshots through `t` and performs no neighbor aggregation.
 
 For current-snapshot structural features, `methods.h_index_representation`
 provides `structure_representation(snapshots, u, t, order, cmax)`. Snapshot
-preprocessing caches h-index orders 1 through 3 and determines the dataset-level
+preprocessing computes h-index orders 1 through 3 and determines the dataset-level
 maximum first-order h-index `hmax`, which is used as the fixed `cmax`. The
 representation concatenates the
 closed-neighborhood distributions for orders `1..order-1` and current
@@ -314,12 +314,24 @@ its width is `order * (hmax + 1)` for `order` in `1..4`.
 
 Snapshot preprocessing also persists **all nodes' four closed-neighborhood
 distributions**, not just the underlying h-index/coreness values. Each snapshot
-stores a node-to-row index and a float64 matrix of shape
+stores a node-to-row index and a float32 matrix of shape
 `[snapshot_nodes, 4 * (hmax + 1)]`, with a version and bucket-width metadata.
 `build_snapshots` automatically fills missing or incompatible distribution
 tables in old caches, without rebuilding already-cached graph decompositions;
 cache replacement is atomic. The first load of an old cache consequently takes
 longer and uses additional disk space. Subsequent loads reuse the tables.
+
+Once a valid complete distribution table is persisted, the three
+`h_index_dicts` intermediates are omitted from the snapshot cache.
+`max_h_index`, global `hmax`, coreness, communities and distribution values
+remain unchanged. Existing caches are pruned atomically, with the policy
+recorded as `h_index_storage` in the partitioned index; feature/state identities
+are unchanged. Slices without a valid distribution table retain their
+intermediates (including the not-yet-preprocessed Wiki distributions).
+Normal training/prediction reads distributions without recomputing h-index.
+Custom structural queries can reconstruct missing intermediates transiently
+from the edges; rebuilding a full distribution table computes them once for
+that table, without restoring persistent dictionaries.
 
 For a task at observed time `t` predicting `t+1`, every T-PPR-selected neighbor
 uses its structure in **G_t**, not the historical event snapshot stored in its
@@ -339,9 +351,10 @@ with direct node-ID row lookup rather than `(node,time)` deduplication.
 The table has a padding row, an absent-node row, and the current snapshot's rows.
 It is shared by all queries at t and released with the context; no append-only
 historical float32 table remains. Construction is charged to `prepare_s`.
-Community prediction now uses a field-partitioned disk snapshot store:
+Training, community prediction (Ours/Zebra), and evaluation sample generation
+share a single field-partitioned disk snapshot store:
 `core_dict` retains at most the model's history length (default five slices);
-edges, float64 distributions and other snapshot metadata each retain at most
+edges, float32 distributions and other snapshot metadata each retain at most
 one slice. Snapshot views themselves hold no loaded payload. After full-time
 input materialization the original distribution/graph payloads are released;
 only the current float32 model structure table remains. Evaluation loads future
@@ -354,10 +367,53 @@ features, **not independent of cumulative graph size**.
 
 On first use, `snapshot_cache/partitioned/` is generated from the legacy cache;
 this one-time migration still reads the complete legacy pickle and needs its
-peak memory. Later runs open only the partitioned store. The legacy files are
-preserved, and training/Zebra retain their existing loaders. A legacy cache
-size/mtime change invalidates the partitioned generation; publishing the new
-index is atomic and old generations are not automatically deleted.
+peak memory. Each written partition is read back and compared before atomic
+index publication. Only then are `snapshots.pkl` and superseded generations
+deleted. All later callers use the lazy store without a monolithic copy.
+The store's identity uses logical window hashes and feature versions,
+independent of legacy pickle files. Changed inputs are rejected, not silently
+reused. An exclusive build lock prevents concurrent cache writers.
+
+Snapshot store v3 saves each edge partition as `<time>-edges.npz`: a losslessly
+compressed two-column endpoint array. Nonnegative node IDs use uint16, uint32
+or uint64 according to their maximum; negative IDs use checked int64.
+Edge order, orientation and multiplicity are unchanged. The redundant
+`min(coreness[u], coreness[v])` column is reconstructed from that slice's
+`core_dict`, preserving the existing list-of-triples API. This saves disk space,
+not Python edge-list memory; edge reads now also require the slice's core table
+and decompression.
+
+Existing v2 stores are upgraded automatically under the build lock: only edges
+are re-encoded and read back for exact comparison. Other partitions are
+hard-linked (or copied if linking is unavailable), then the new index is
+published atomically before old files are removed. Model inputs, feature
+metadata and streaming-state identities do not change; no retraining is needed.
+
+Community components are computed and persisted only for K=3–7. A snapshot
+whose maximum coreness is below a requested K has no entry for that K (callers
+already treat it as an empty community). This does **not** clip node coreness,
+`max_core`, h-index values, distributions, or model labels. Existing stores
+automatically drop out-of-range entries from `k_core_comps`, verify retained
+content, and atomically publish the result; edges and other feature partitions
+are reused. The index records `community_ks`, separately from model-feature
+metadata, so valid evaluation samples and streaming states remain reusable.
+
+Fresh builds stage individual graph snapshots to determine global feature
+dimensions, then compute/write distribution tables one slice at a time.
+Staging files are temporary; they are removed on completion or handled errors.
+This bounds preprocessing retention to a small number of snapshots, but does
+not change the memory needs of downstream algorithms.
+
+To migrate existing caches **without adding missing distribution tables**:
+
+```bash
+python -m datasets.snapshot_store <time_slices_dir> [<another_time_slices_dir> ...]
+```
+
+Normal training/evaluation loads still complete missing distribution tables
+when required. Storage-only migration of an old Wiki cache does not trigger
+that potentially large preprocessing step. Stop readers of that dataset before
+migrating: old snapshot views refer to generation files removed at completion.
 This is an I/O/retention change, not a model change; current-snapshot checkpoints
 need no retraining. Disk reads during state/feature preparation count toward
 `prepare_s`; future-truth reads remain evaluation time.
@@ -372,11 +428,28 @@ and masked. The scalar `top_neighbors` API remains unchanged for edge generation
 and other callers; maintained T-PPR state, ranking and capacity are unchanged.
 
 This corrects the old feature semantics and requires retraining. Training uses
-the new `hybrid_features_v8_current_snapshot_*` cache namespace and never reuses
+the new `hybrid_features_v9_float32_current_snapshot_*` cache namespace and never reuses
 v7 historical-structure inputs. Checkpoints must explicitly contain
 `feature_config.structure_time_reference="current_observed_snapshot"`; missing
-or different metadata is rejected. Old caches/checkpoints are retained on disk,
-not overwritten or silently converted.
+or different metadata is rejected. Obsolete feature caches and incompatible
+checkpoints were removed during cleanup; they are not silently converted.
+
+Active numerical arrays use float32: structure distributions, TCS penalties
+and representations, maintained T-PPR scores/normalizers, model features and
+Zebra history-cache floating tensors. Legacy float64 structure files are cast
+once, read back and compared with the former float32 model input, then
+published atomically without recomputing graph features.
+IDs/counts/index arrays remain integers. Python/JSON scalars and timing clocks
+keep their native types; external Zebra runtime/Numba types are not modified
+here (its cache adapter converts at the boundary).
+
+Float32 T-PPR/TCS arithmetic can change rounding and near-tie rankings.
+Training therefore uses a new v9 feature namespace; old v8 features are not
+reused. Hybrid history caches require `numeric_dtype="float32"` and Zebra
+history caches use version 2/new identities, so old numeric states are rebuilt.
+Existing model weights remain loadable, but inference warns for checkpoints
+without the float32 feature marker; re-evaluate their accuracy under the new
+numeric pipeline. This change does not automatically retrain models.
 
 Distribution precomputation belongs to snapshot preprocessing (or the one-time
 cache upgrade), not `prepare_s`. End-to-end timing for a newly arriving snapshot
@@ -448,12 +521,15 @@ the existing 128-to-32 state projection. Its weights are initially copied from
 the input coreness table, but are separate parameters and train independently.
 The tied decoder, output-head selector and dedicated comparison scripts have
 been removed. Checkpoints must explicitly declare `output_head_type="linear"`;
-tied checkpoints and missing output-head metadata are rejected. Existing default
-checkpoint files are not automatically replaced. Compatible local models are
+tied checkpoints and missing output-head metadata are rejected. Obsolete default
+checkpoint files were deleted and not replaced. Pass `--checkpoint` explicitly
+when predicting with the compatible local models:
 `results/current_snapshot_training_20260914_4ymmR4/{email,mooc}.pt`.
 The older fusion-ablation and Wiki checkpoints use retired feature semantics
-and have been moved to the local ignored artifact archive; they cannot be
-loaded by the current predictor.
+and were deleted along with obsolete local experiment artifacts. Wiki requires
+retraining before use with the current predictor. Old unversioned Hybrid state
+caches were also deleted; the next run rebuilds them with the current identity.
+Reusable snapshot/sample caches and Zebra state caches remain intact.
 See [historical output-head results](docs/archive/model-experiments/output-head-ablation-results.md);
 archived commands describe retired versions, not the current code.
 
@@ -468,8 +544,8 @@ examined nodes and new model predictions.
 
 ## Community Recovery
 
-1. Build `slice_*.csv` files from the raw edge list with `datasets.build_time_slices`.
-2. Load those slice files and construct cached k-core snapshots.
+1. Index time windows in the main CSV with `datasets.build_time_slices`.
+2. Read the indexed byte ranges and construct cached k-core snapshots.
 3. Use either the hybrid model to predict next-snapshot node coreness on demand
    during BFS or Zebra to predict next-snapshot links.
 4. Hybrid returns q's threshold-connected BFS region; Zebra recovers q's
@@ -507,16 +583,62 @@ seconds, and a window length in seconds.
 python -m datasets.build_time_slices email-Eu-core-temporal 604800 604800
 ```
 
-This writes non-empty `slice_*.csv` files and `metadata.json` to
-`data/email-Eu-core-temporal/time_slices/step_604800_window_604800/`. A slice
-contains edges in `[start_ts, start_ts + window_seconds)`. When the step is
-shorter than the window, an edge can appear in multiple overlapping slices.
+This writes `metadata.json` (format `indexed_csv_v1`) to
+`data/email-Eu-core-temporal/time_slices/step_604800_window_604800/`, without
+duplicating records into `slice_*.csv`. The main CSV must have exactly the
+`u,v,ts` header and one integer record per line, sorted by timestamp. Each
+non-empty window records `[start_ts, end_ts)`, `[start_byte, end_byte)`, its row
+count and an ordered SHA-256 of normalized records. The source size,
+nanosecond modification time and SHA-256 are recorded too. Readers seek
+directly into the main CSV, preserving row order, duplicates and orientation.
+Overlapping windows reference the same source bytes instead of copying them.
+Normal loading checks source size and modification time, including before
+loading existing snapshot caches or taking the warm partitioned-cache fast
+path; these checks are not a full hash rescan.
+Treat the indexed source as immutable: editing it requires rebuilding both
+the index and derived caches.
 Windows are aligned backwards from `last_timestamp + 1`, so the newest window
 is complete. Leading windows that overlap the dataset are retained, so any
 short observation interval occurs only at the beginning, not at the prediction
 end of the timeline. Each dataset keeps one active slice configuration. A
 successful rebuild replaces its previous `time_slices` directory, including
 stale snapshot, sample, and evaluation caches derived from the old slices.
+
+To migrate **existing** configurations without changing windows or deleting
+reusable caches, use the separate migration command:
+
+```bash
+python -u -m datasets.migrate_slice_storage
+```
+
+It discovers only existing `data/*/time_slices/*/metadata.json` configurations;
+datasets without chosen windows are left alone. For each configuration it
+compares every legacy slice's record count and ordered normalized SHA-256
+against the source range before atomically publishing the index. It then
+deletes only the verified legacy slice CSVs, preserving all cache directories
+and a small `legacy-metadata.json` audit copy. Deleted slice CSVs can be
+reconstructed from the unchanged source and window boundaries; they are not
+kept in a backup. The migrated `file` fields are historical cleanup identifiers,
+not reader inputs. Interruptions during cleanup are safely resumable by
+rerunning the command. Failed verification leaves the legacy configuration
+untouched; failures are logged, other configurations continue, and the process
+exits nonzero if any failed. Do not run source edits, slice rebuilds or
+training/evaluation concurrently with migration. Old CSV-backed configurations
+remain readable until migrated.
+
+Ours historical-state cache identities use `v2:` content keys: dataset/window
+parameters, ordered window boundaries/counts/content hashes, and parsed
+snapshot-feature metadata. Storage format, slice filenames, byte offsets,
+source modification time and JSON formatting do not enter this identity.
+Consequently a verified CSV-to-index migration does not invalidate caches
+created with the v2 scheme. Indexed identities reuse certified hashes without
+rescanning the main CSV; legacy CSV configurations must hash their slice
+contents once at predictor construction. Old, unversioned state-cache keys
+hashed only metadata file bytes and did not certify data contents. They are
+not automatically aliased to v2: the first prediction rebuilds historical
+state once and uses the existing automatic save mechanism. Model weights,
+graph snapshots and training samples do not need rebuilding for this key
+upgrade. Do not bypass source validation by manually restoring file timestamps.
 
 Build the required time slices before training or evaluation.
 
@@ -550,8 +672,7 @@ data/
     <dataset>.csv               # Raw temporal edges: u,v,ts
     time_slices/
       step_<step>_window_<window>/
-        slice_*.csv             # Generated input snapshots
-        metadata.json           # Slice boundaries and counts
+        metadata.json           # Window byte ranges, counts and source signature
         snapshot_cache/         # Derived k-core snapshots
         sample_cache/           # Derived test samples
         community_eval/         # Optional persisted evaluation set

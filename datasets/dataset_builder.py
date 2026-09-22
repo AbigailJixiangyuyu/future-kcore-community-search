@@ -14,11 +14,11 @@ import os
 import pickle
 import tempfile
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import networkit as nk
 
+from datasets.indexed_slices import STORAGE_FORMAT, iter_indexed_edges, validate_source
 from methods.h_index_representation import (
     MAX_H_INDEX_ORDER,
     STRUCTURE_DISTRIBUTION_KEY,
@@ -90,6 +90,11 @@ def load_time_slice_manifest(slices_dir):
         raise ValueError(f"Invalid time-slice metadata: {manifest_path}")
     if not isinstance(manifest["slices"], list) or not manifest["slices"]:
         raise ValueError(f"Time-slice metadata has no slices: {manifest_path}")
+    storage = manifest.get("storage_format")
+    if storage == STORAGE_FORMAT:
+        validate_source(slices_dir, manifest)
+    elif storage is not None:
+        raise ValueError(f"Unsupported slice storage format: {storage}")
     return manifest
 
 
@@ -104,6 +109,16 @@ def _load_slice_edges(slice_path):
             return [(int(row["u"]), int(row["v"])) for row in reader]
         except (TypeError, ValueError) as error:
             raise ValueError(f"Invalid edge in {slice_path}") from error
+
+
+def load_slice_edges(slices_dir, manifest, slice_info):
+    if manifest.get("storage_format") == STORAGE_FORMAT:
+        source = validate_source(slices_dir, manifest)
+        return list(iter_indexed_edges(source, slice_info))
+    filename = slice_info.get("file")
+    if not filename:
+        raise ValueError("Legacy slice has no file")
+    return _load_slice_edges(Path(slices_dir) / filename)
 
 
 def _build_snapshot(slice_edges):
@@ -130,15 +145,13 @@ def _build_snapshot(slice_edges):
     core_dict = {id_to_node[index]: int(core) for index, core in enumerate(core_values)}
     max_core = int(max(core_values)) if core_values else 0
 
-    nodes_by_core = defaultdict(set)
-    for node, core in core_dict.items():
-        nodes_by_core[core].add(node)
-
     k_core_comps = {}
-    for k in range(1, max_core + 1):
-        cumulative_ids = set()
-        for core in range(k, max_core + 1):
-            cumulative_ids.update(node_to_id[node] for node in nodes_by_core.get(core, set()))
+    for k in TARGET_KS:
+        if k > max_core:
+            continue
+        cumulative_ids = {
+            node_to_id[node] for node, core in core_dict.items() if core >= k
+        }
 
         cumulative_list = sorted(cumulative_ids)
         local_id = {node_id: index for index, node_id in enumerate(cumulative_list)}
@@ -238,17 +251,31 @@ def _write_snapshot_cache(cache_path, snapshots, total_nodes, kmax, hmax):
 
 
 def build_snapshots(slices_dir):
-    """Build one k-core snapshot per generated time-slice CSV.
+    """Open the single partitioned cache used by all active consumers."""
+    from datasets.snapshot_store import open_snapshot_store
+    return open_snapshot_store(slices_dir)
+
+
+def _build_snapshot_inputs(slices_dir, manifest, staging, precompute_structures=True,
+                           existing=None):
+    """Build one k-core snapshot per indexed window (or legacy slice CSV).
 
     The input is a ``time_slices/step_<step>_window_<window>`` directory, not
     the raw dataset CSV. The resulting cache is scoped to that exact slice
     configuration so different window choices cannot share stale state.
     """
     slices_dir = Path(slices_dir)
-    manifest = load_time_slice_manifest(slices_dir)
     cache_dir = slices_dir / "snapshot_cache"
     cache_path = cache_dir / "snapshots.pkl"
-    metadata_path = cache_dir / "metadata.json"
+    if existing is not None:
+        def completed():
+            for view in existing:
+                snapshot = dict(view)
+                if not has_structure_distributions(snapshot, existing.metadata["hmax"]):
+                    add_structure_distributions(snapshot, existing.metadata["hmax"])
+                yield snapshot
+        return (completed(), existing.metadata["total_nodes"],
+                existing.metadata["kmax"], existing.metadata["hmax"])
 
     if cache_path.exists():
         print(f"[dataset_builder] Loading cached snapshots from {cache_path}")
@@ -256,15 +283,12 @@ def build_snapshots(slices_dir):
             cached = pickle.load(cache_file)
         snapshots = cached["snapshots"]
         total_nodes = cached["total_nodes"]
-        cache_changed = False
         for snapshot in snapshots:
             if not _has_h_index_features(snapshot):
                 _add_h_index_features(snapshot)
-                cache_changed = True
             max_h_index = _first_order_hmax(snapshot)
             if snapshot.get("max_h_index") != max_h_index:
                 snapshot["max_h_index"] = max_h_index
-                cache_changed = True
         kmax = cached.get(
             "kmax", max((snapshot["max_core"] for snapshot in snapshots), default=0)
         )
@@ -272,72 +296,38 @@ def build_snapshots(slices_dir):
             (snapshot["max_h_index"] for snapshot in snapshots),
             default=0,
         )
-        if cached.get("kmax") != kmax:
-            cache_changed = True
-        if cached.get("hmax") != hmax:
-            cache_changed = True
-        if _prepare_structure_distributions(snapshots, hmax):
-            cache_changed = True
-        if cache_changed:
-            _write_snapshot_cache(cache_path, snapshots, total_nodes, kmax, hmax)
-            print(f"[dataset_builder] Upgraded snapshot cache at {cache_path}")
-        metadata = {
-            "snapshot_count": len(snapshots),
-            "total_nodes": total_nodes,
-            "kmax": kmax,
-            "hmax": hmax,
-            "max_h_index_order": MAX_H_INDEX_ORDER,
-            "structure_distribution_version": STRUCTURE_DISTRIBUTION_VERSION,
-            "structure_distribution_order": MAX_H_INDEX_ORDER + 1,
-            "structure_distribution_cmax": hmax,
-        }
-        if (
-            not metadata_path.exists()
-            or json.loads(metadata_path.read_text()) != metadata
-        ):
-            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
-        return snapshots, total_nodes, kmax, hmax
+        def upgraded():
+            for snapshot in snapshots:
+                if precompute_structures and not has_structure_distributions(snapshot, hmax):
+                    add_structure_distributions(snapshot, hmax)
+                yield snapshot
+                # Release upgraded dense arrays as the writer advances.
+                snapshot.pop(STRUCTURE_DISTRIBUTION_KEY, None)
+        return upgraded(), total_nodes, kmax, hmax
 
-    snapshots = []
     total_node_ids = set()
+    kmax = hmax = 0
     for position, slice_info in enumerate(manifest["slices"]):
-        slice_filename = slice_info.get("file")
-        if not slice_filename:
-            raise ValueError(f"Slice {position} has no file in {slices_dir / 'metadata.json'}")
-        slice_path = slices_dir / slice_filename
-        if not slice_path.is_file():
-            raise FileNotFoundError(f"Time-slice file not found: {slice_path}")
-
-        slice_edges = _load_slice_edges(slice_path)
+        slice_edges = load_slice_edges(slices_dir, manifest, slice_info)
         snapshot = _build_snapshot(slice_edges)
         snapshot["slice_index"] = slice_info.get("index", position)
         snapshot["start_ts"] = slice_info.get("start_ts")
         snapshot["end_ts"] = slice_info.get("end_ts")
-        snapshots.append(snapshot)
+        # Dataset-wide hmax is needed before constructing distribution tables.
+        # Stage only one snapshot at a time instead of retaining the dataset.
+        with (staging / "{}.pkl".format(position)).open("wb") as out:
+            pickle.dump(snapshot, out, protocol=pickle.HIGHEST_PROTOCOL)
+        kmax = max(kmax, snapshot["max_core"])
+        hmax = max(hmax, snapshot["max_h_index"])
         total_node_ids.update(node for edge in slice_edges for node in edge)
 
     total_nodes = len(total_node_ids)
-    kmax = max((snapshot["max_core"] for snapshot in snapshots), default=0)
-    hmax = max((snapshot["max_h_index"] for snapshot in snapshots), default=0)
-    _prepare_structure_distributions(snapshots, hmax)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _write_snapshot_cache(cache_path, snapshots, total_nodes, kmax, hmax)
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "snapshot_count": len(snapshots),
-                "total_nodes": total_nodes,
-                "kmax": kmax,
-                "hmax": hmax,
-                "max_h_index_order": MAX_H_INDEX_ORDER,
-                "structure_distribution_version": STRUCTURE_DISTRIBUTION_VERSION,
-                "structure_distribution_order": MAX_H_INDEX_ORDER + 1,
-                "structure_distribution_cmax": hmax,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    print(f"[dataset_builder] Cached snapshots to {cache_path}")
-
-    return snapshots, total_nodes, kmax, hmax
+    def finished():
+        for position in range(len(manifest["slices"])):
+            path = staging / "{}.pkl".format(position)
+            with path.open("rb") as src:
+                snapshot = pickle.load(src)
+            add_structure_distributions(snapshot, hmax)
+            yield snapshot
+            path.unlink()
+    return finished(), total_nodes, kmax, hmax

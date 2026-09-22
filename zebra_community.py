@@ -24,6 +24,7 @@ from datasets.community_eval_builder import (
     set_metrics,
 )
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
+from datasets.baseline_eval import load_test_samples, require_fit_boundary
 from methods.zebra_history_cache import ZebraHistoryCache
 
 
@@ -352,7 +353,7 @@ def _progressive_run_signature(predictor, samples, start_t, end_t):
     digest.update(predictor.checkpoint_hash.encode("ascii"))
     digest.update(predictor.config_hash.encode("ascii"))
     digest.update(predictor.mapping_hash.encode("ascii"))
-    digest.update(np.float64(predictor.threshold).tobytes())
+    digest.update(np.float32(predictor.threshold).tobytes())
     digest.update(json.dumps(predictor.candidate_metadata,
                              sort_keys=True).encode("ascii"))
     digest.update(predictor.edge_index.signature.encode("ascii"))
@@ -556,7 +557,7 @@ class ZebraCommunityPredictor:
         digest.update(self.checkpoint_hash.encode("ascii"))
         digest.update(self.config_hash.encode("ascii"))
         digest.update(self.mapping_hash.encode("ascii"))
-        digest.update(np.float64(self.threshold).tobytes())
+        digest.update(np.float32(self.threshold).tobytes())
         digest.update(np.int64(t).tobytes())
         digest.update(np.asarray(original_nodes, dtype=np.int64).tobytes())
         return self.cache_dir / "{}.npz".format(digest.hexdigest())
@@ -820,7 +821,7 @@ def _load_completed_records(work_dir, samples, run_signature):
 def _aggregate_completed_records(records):
     result = {}
     for name in COMMUNITY_METRICS:
-        result[name] = float(np.mean([record[name] for record in records]))
+        result[name] = float(np.mean([record[name] for record in records], dtype=np.float32))
     result["samples"] = len(records)
     result["predicted_edge_count"] = int(sum(
         record["predicted_edge_count"] for record in records
@@ -880,7 +881,7 @@ def _build_progress_payload(dataset_name, predictor, samples, records,
         macro = {
             name: float(np.mean([
                 metrics[name] for metrics in completed_metrics
-            ]))
+            ], dtype=np.float32))
             for name in COMMUNITY_METRICS
         }
     return {
@@ -1245,6 +1246,19 @@ def _progressive_status(args):
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def _verified_snapshot_split(predictor, dataset):
+    split_path = Path(str(predictor.zebra.checkpoint_path) + ".split.json")
+    if not split_path.is_file():
+        raise ValueError("Zebra checkpoint has no 7:3 snapshot split metadata; retrain")
+    split = json.loads(split_path.read_text())
+    if (split.get("split_rule") != "snapshot_55_15_30_v1"
+            or split.get("snapshot_count") != len(predictor.snapshots)
+            or split.get("dataset") != dataset
+            or split.get("checkpoint_sha256") != predictor.checkpoint_hash):
+        raise ValueError("Zebra checkpoint snapshot split does not match slices")
+    return require_fit_boundary(split.get("fit_end_t"), len(predictor.snapshots))
+
+
 def _evaluate(args):
     wall_start = time.perf_counter()
     predictor, total_nodes = _build_predictor(args)
@@ -1253,17 +1267,14 @@ def _evaluate(args):
     sample_started = time.perf_counter()
     manifest = load_time_slice_manifest(args.slices_dir)
     dataset_name = manifest["dataset"]
-    start_t = predictor.test_start_t if args.start_t is None else args.start_t
-    samples = sample_qk_coreness_weighted(
-        predictor.snapshots,
-        int(len(predictor.snapshots) * 0.7),
-        [3, 4, 5, 6, 7],
-        dataset_name=dataset_name,
-        cache_dir=Path(args.slices_dir) / "sample_cache",
-    )
+    split_t = _verified_snapshot_split(predictor, args.zebra_dataset)
+    start_t = split_t if args.start_t is None else args.start_t
+    if not split_t <= start_t < len(predictor.snapshots) - 1:
+        raise ValueError("evaluation start outside the shared held-out range")
+    samples = load_test_samples(args.slices_dir, len(predictor.snapshots))
     samples = [
         sample for sample in samples
-        if sample["t"] >= start_t and sample["community"]
+        if sample["t"] >= start_t
     ]
     if args.max_samples is not None:
         samples = samples[:args.max_samples]
@@ -1293,7 +1304,8 @@ def _evaluate(args):
             rows[sample["k"]].append({
                 **metrics,
                 **timing,
-                "size_ratio": len(prediction) / len(sample["community"]),
+                "size_ratio": len(prediction) / len(sample["community"])
+                if sample["community"] else 0.0,
                 "pred_ratio": len(prediction) / total_nodes * 100,
             })
             metric_s += time.perf_counter() - metric_started
@@ -1311,7 +1323,7 @@ def _evaluate(args):
     )
     for k, values in rows.items():
         per_k[k].update({
-            name: float(np.mean([row[name] for row in values]))
+            name: float(np.mean([row[name] for row in values], dtype=np.float32))
             for name in timing_names
         })
     macro = {}
@@ -1322,7 +1334,7 @@ def _evaluate(args):
         ) + timing_names:
             macro[name] = float(np.mean([
                 result[name] for result in per_k.values()
-            ]))
+            ], dtype=np.float32))
     result = {
         **TIMING_SCHEMA,
         "dataset": dataset_name,
@@ -1330,7 +1342,7 @@ def _evaluate(args):
         "threshold": predictor.threshold,
         **predictor.candidate_metadata,
         "samples": len(samples),
-        "candidate_size_mean": float(np.mean(candidate_sizes)) if samples else 0.0,
+        "candidate_size_mean": float(np.mean(candidate_sizes, dtype=np.float32)) if samples else 0.0,
         "candidate_size_max": max(candidate_sizes, default=0),
         "query_set_sha256": hashlib.sha256(json.dumps(sorted(
             (int(s["query"]), int(s["k"]), int(s["t"])) for s in samples

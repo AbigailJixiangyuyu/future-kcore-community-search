@@ -60,7 +60,7 @@ def _weighted_sample(rng, candidates, cur_cd, k, n):
     if len(candidates) <= n:
         return list(candidates)
     weights = np.array(
-        [cur_cd.get(q, 0) - k + 1 for q in candidates], dtype=np.float64
+        [cur_cd.get(q, 0) - k + 1 for q in candidates], dtype=np.float32
     )
     weights = np.maximum(weights, 1.0)
     weights /= weights.sum()

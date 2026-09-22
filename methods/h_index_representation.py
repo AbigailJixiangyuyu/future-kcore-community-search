@@ -10,6 +10,18 @@ STRUCTURE_DISTRIBUTION_VERSION = 1
 STRUCTURE_DISTRIBUTION_KEY = "structure_distributions"
 
 
+def _h_index_values(snapshot, max_order):
+    """Use intermediates if available; otherwise rebuild them transiently."""
+    levels = snapshot.get("h_index_dicts")
+    if isinstance(levels, Mapping) and all(
+        isinstance(levels.get(order), Mapping) for order in range(1, max_order + 1)
+    ):
+        return levels
+    return compute_h_index_levels(
+        snapshot["edge_list"], snapshot["core_dict"], max_order=max_order
+    )
+
+
 def has_structure_distributions(snapshot, cmax):
     """Validate a complete, fixed-width snapshot distribution table."""
     return validated_structure_distributions(snapshot, cmax) is not None
@@ -32,7 +44,7 @@ def validated_structure_distributions(snapshot, cmax):
         and cached.get("cmax") == cmax
         and isinstance(rows, dict)
         and isinstance(values, np.ndarray)
-        and values.dtype == np.float64
+        and values.dtype in (np.dtype("float32"), np.dtype("float64"))
         and values.shape == (len(rows), (MAX_H_INDEX_ORDER + 1) * (cmax + 1))
     ):
         return None
@@ -47,8 +59,7 @@ def validated_structure_distributions(snapshot, cmax):
 def add_structure_distributions(snapshot, cmax):
     """Precompute every node's four distributions once, before inference.
 
-    Keep float64 to exactly preserve the existing structural-feature API;
-    model-input materialization still casts to float32 as before.
+    Compute and store the model-input float32 representation.
     """
     if not isinstance(cmax, int):
         raise TypeError("cmax must be an integer")
@@ -62,10 +73,16 @@ def add_structure_distributions(snapshot, cmax):
             adjacency.setdefault(u, set()).add(v)
             adjacency.setdefault(v, set()).add(u)
     order = MAX_H_INDEX_ORDER + 1
-    values = np.empty((len(nodes), order * (cmax + 1)), dtype=np.float64)
+    # Rebuild missing intermediates once for the entire table, not once per node.
+    working = {
+        "edge_list": snapshot["edge_list"],
+        "core_dict": snapshot["core_dict"],
+        "h_index_dicts": _h_index_values(snapshot, MAX_H_INDEX_ORDER),
+    }
+    values = np.empty((len(nodes), order * (cmax + 1)), dtype=np.float32)
     for row, node in enumerate(nodes):
         values[row] = structure_representation(
-            [snapshot], node, 0, order, cmax, adjacency=adjacency
+            [working], node, 0, order, cmax, adjacency=adjacency
         )
     snapshot[STRUCTURE_DISTRIBUTION_KEY] = {
         "version": STRUCTURE_DISTRIBUTION_VERSION,
@@ -187,12 +204,7 @@ def structure_representation(snapshots, u, t, order, cmax, adjacency=None):
 
     value_maps = []
     if order > 1:
-        h_index_dicts = snapshot.get("h_index_dicts")
-        if not isinstance(h_index_dicts, Mapping):
-            raise ValueError(
-                f"snapshot {t} has no preprocessed h_index_dicts; "
-                "rebuild its snapshot cache"
-            )
+        h_index_dicts = _h_index_values(snapshot, order - 1)
         for h_order in range(1, order):
             values = h_index_dicts.get(h_order)
             if not isinstance(values, Mapping):
@@ -219,7 +231,7 @@ def structure_representation(snapshots, u, t, order, cmax, adjacency=None):
 
     blocks = []
     for values in value_maps:
-        block = np.zeros(cmax + 1, dtype=np.float64)
+        block = np.zeros(cmax + 1, dtype=np.float32)
         for node in closed_neighborhood:
             value = int(values.get(node, 0))
             if value < 0:

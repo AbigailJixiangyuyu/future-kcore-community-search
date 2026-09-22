@@ -29,7 +29,7 @@ coreness-prediction/
 │       ├── <dataset>.csv          # Raw edges: u,v,ts
 │       └── time_slices/
 │           └── step_<step>_window_<window>/
-│               ├── slice_*.csv   # Generated sliding-window edge slices
+│               ├── metadata.json # Window byte ranges into the main CSV
 │               ├── snapshot_cache/  # Cached k-core snapshots
 │               ├── sample_cache/    # Cached test samples
 │               └── community_eval/  # Persisted evaluation set (optional)
@@ -60,6 +60,42 @@ TCS(v,t,k) = 1 - (1/W) Σ w_i · (k - c_i) / max(k, c_i)
 CSV format `u,v,ts`. All subsequent sample generation, evaluation, and result
 reporting must use `k in [3, 4, 5, 6, 7]`. Do not test or report `k >= 8`
 unless the user explicitly requests a different range.
+
+New time slices use `indexed_csv_v1`: the main CSV remains a single immutable
+file and `metadata.json` stores window byte ranges, row counts and fingerprints.
+Legacy CSV slices remain readable. Use `python -u -m datasets.migrate_slice_storage`
+to verify and migrate existing configurations while preserving all caches.
+The ordinary `build_time_slices` command remains a rebuild operation that
+replaces old configurations and derived caches, not a migration command.
+The partitioned snapshot cache fast path also validates the indexed source.
+All active snapshot consumers, including training, Zebra and evaluation sample
+generation, use the same lazy partitioned cache through `build_snapshots`.
+Cache v3 is keyed by logical windows and feature versions. Edge partitions use
+compressed two-column integer arrays (`*-edges.npz`) with checked ID widths;
+the legacy edge triple API reconstructs min-core from `core_dict`. v2 caches
+upgrade without rebuilding features or changing streaming-state identities.
+Legacy `snapshots.pkl`
+and superseded partitions are deleted only after verified atomic publication.
+Use `python -m datasets.snapshot_store <time_slices_dir> ...` for storage-only
+migration without adding missing dense distributions. Stop concurrent readers
+before migration; normal loads complete missing features when needed.
+Only K=3–7 community components are computed/stored (`community_ks` in the
+partitioned index). Existing caches are pruned without changing the retained
+communities or model features. Node coreness and `max_core` remain unrestricted;
+do not clamp labels or structural values to the community evaluation range.
+Completed distribution caches omit `h_index_dicts`; keep them only for slices
+without valid distributions. Preserve `max_h_index`/`hmax` metadata.
+Normal model inputs read distributions directly; custom/fallback computations
+reconstruct missing h-index intermediates transiently from the snapshot graph.
+Active numerical arrays/states use float32; IDs and indices retain integer
+types. Structure storage migrates legacy float64 arrays without recomputation.
+Float32 T-PPR/TCS training uses `hybrid_features_v9_float32_current_snapshot_*`;
+old numeric history caches must not be reused. Python/JSON scalars and timing
+clocks retain native types. External Zebra runtime types are preserved at the
+adapter boundary; its persisted floating tensors are float32.
+Ours state-cache identity `v2:` hashes logical window contents and feature
+metadata, not physical slice storage. Old unversioned state caches are not
+automatically trusted; only streaming state needs a one-time recomputation.
 
 Required evaluation scope for subsequent work:
 

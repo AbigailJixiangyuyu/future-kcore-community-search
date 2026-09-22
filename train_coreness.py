@@ -78,7 +78,7 @@ def _model_batch(batch, structure_table, device):
 def _feature_cache_stem(kmax, hmax, config):
     max_nodes = config["max_nodes_per_time"]
     return (
-        f"hybrid_features_v8_current_snapshot_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
+        f"hybrid_features_v9_float32_current_snapshot_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
         f"ik{config['t_ppr_internal_top_k']}_"
         f"o{config['order']}_a{config['t_ppr_alpha']}_"
         f"b{config['t_ppr_beta']}_p{config['min_probability']}_"
@@ -240,8 +240,8 @@ def evaluate_model(model, loader, structure_table, criterion, device, kmax):
     truth = np.concatenate(labels)
     result = {
         "loss": total_loss / len(truth),
-        "accuracy": float(np.mean(prediction == truth)),
-        "mae": float(np.mean(np.abs(prediction - truth))),
+        "accuracy": float(np.mean(prediction == truth, dtype=np.float32)),
+        "mae": float(np.mean(np.abs(prediction - truth), dtype=np.float32)),
         "per_k": {},
     }
     for k in EVALUATION_KS:
@@ -288,6 +288,7 @@ def train(args):
         raise ValueError("train, validation, and test splits must all be non-empty")
 
     feature_config = {
+        "numeric_dtype": "float32",
         "structure_time_reference": STRUCTURE_TIME_REFERENCE,
         "top_l": args.top_l,
         "t_ppr_internal_top_k": args.t_ppr_internal_top_k,

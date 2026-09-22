@@ -92,7 +92,7 @@ def _update_source_rows(
         edge_end = adjacency_offsets[source_position + 1]
         degree = edge_end - edge_start
         old_norm = norms[source_row]
-        new_norm = beta * old_norm + degree
+        new_norm = beta * old_norm + np.float32(degree)
         output_norms[source_position] = new_norm
 
         candidate_count = state_lengths[source_row]
@@ -105,7 +105,7 @@ def _update_source_rows(
             hash_capacity *= 2
         hash_nodes = np.zeros(hash_capacity, dtype=np.int64)
         hash_times = np.full(hash_capacity, -1, dtype=np.int32)
-        hash_scores = np.zeros(hash_capacity, dtype=np.float64)
+        hash_scores = np.zeros(hash_capacity, dtype=np.float32)
 
         if old_norm > 0.0:
             old_scale = beta * old_norm / new_norm
@@ -119,7 +119,7 @@ def _update_source_rows(
                     state_scores[source_row, position] * old_scale,
                 )
 
-        neighbor_scale = (1.0 - alpha) / new_norm
+        neighbor_scale = (np.float32(1.0) - alpha) / new_norm
         terminal_score = neighbor_scale * alpha
         for edge_position in range(edge_start, edge_end):
             neighbor_row = neighbor_rows[edge_position]
@@ -213,9 +213,9 @@ class TemporalPPRStreamingIndex:
         shape = (len(self._nodes), self.internal_top_k)
         self._state_nodes = np.zeros(shape, dtype=np.int64)
         self._state_times = np.full(shape, -1, dtype=np.int32)
-        self._state_scores = np.zeros(shape, dtype=np.float64)
+        self._state_scores = np.zeros(shape, dtype=np.float32)
         self._state_lengths = np.zeros(len(self._nodes), dtype=np.int32)
-        self._norms = np.zeros(len(self._nodes), dtype=np.float64)
+        self._norms = np.zeros(len(self._nodes), dtype=np.float32)
 
     def _rows_for_nodes(self, nodes):
         """Map graph node IDs to rows in the fixed-width state arrays."""
@@ -257,9 +257,9 @@ class TemporalPPRStreamingIndex:
         output_shape = (len(active_rows), self.internal_top_k)
         output_nodes = np.zeros(output_shape, dtype=np.int64)
         output_times = np.full(output_shape, -1, dtype=np.int32)
-        output_scores = np.zeros(output_shape, dtype=np.float64)
+        output_scores = np.zeros(output_shape, dtype=np.float32)
         output_lengths = np.zeros(len(active_rows), dtype=np.int32)
-        output_norms = np.zeros(len(active_rows), dtype=np.float64)
+        output_norms = np.zeros(len(active_rows), dtype=np.float32)
 
         # The kernel reads only the preceding global state. Each worker writes
         # one private output row, so same-snapshot updates cannot leak between
@@ -275,9 +275,9 @@ class TemporalPPRStreamingIndex:
             self._state_lengths,
             self._norms,
             snapshot_time,
-            self.temporal_ppr.alpha,
-            self.temporal_ppr.beta,
-            self.min_score,
+            np.float32(self.temporal_ppr.alpha),
+            np.float32(self.temporal_ppr.beta),
+            np.float32(self.min_score),
             output_nodes,
             output_times,
             output_scores,
@@ -330,8 +330,8 @@ class TemporalPPRStreamingIndex:
         result = {
             "nodes": np.zeros(shape, dtype=np.int64),
             "times": np.zeros(shape, dtype=np.int32),
-            "scores": np.zeros(shape, dtype=np.float64),
-            "weights": np.zeros(shape, dtype=np.float64),
+            "scores": np.zeros(shape, dtype=np.float32),
+            "weights": np.zeros(shape, dtype=np.float32),
             "mask": np.zeros(shape, dtype=np.bool_),
         }
         if not len(nodes) or not len(self._nodes):
@@ -408,7 +408,7 @@ class TemporalPPRStreamingIndex:
         if not length:
             return ()
         scores = self._state_scores[row, :length]
-        selected_total = float(scores.sum())
+        selected_total = scores.sum(dtype=np.float32)
         if selected_total == 0.0:
             return ()
         return tuple(
@@ -524,7 +524,7 @@ class TemporalPPR:
         # Equal-time interactions receive equal probability. Moving to the
         # next older time group advances the recency rank by the group size.
         weighted = []
-        group_weight = 1.0
+        group_weight = np.float32(1.0)
         position = end
         while position > 0:
             group_end = position
@@ -535,9 +535,9 @@ class TemporalPPR:
                 weighted.append((neighbor, time, group_weight))
             # Edges in one snapshot form one recency group. Advancing to the
             # next older group applies beta once, regardless of group size.
-            group_weight *= self.beta
+            group_weight *= np.float32(self.beta)
 
-        denominator = sum(weight for _, _, weight in weighted)
+        denominator = np.sum([weight for _, _, weight in weighted], dtype=np.float32)
         return tuple(
             (neighbor, time, weight / denominator)
             for neighbor, time, weight in weighted
@@ -564,17 +564,17 @@ class TemporalPPR:
             raise ValueError("min_probability must be non-negative")
 
         # Index t + 1 is a source-only cutoff, not a returned temporal node.
-        pending = [defaultdict(float) for _ in range(t + 2)]
-        pending[t + 1][u] = 1.0
-        scores = defaultdict(float)
+        pending = [defaultdict(np.float32) for _ in range(t + 2)]
+        pending[t + 1][u] = np.float32(1.0)
+        scores = defaultdict(np.float32)
 
         for cutoff in range(t + 1, -1, -1):
             for node, reaching_probability in pending[cutoff].items():
                 is_source = cutoff == t + 1 and node == u
                 if not is_source:
-                    scores[(node, cutoff)] += self.alpha * reaching_probability
+                    scores[(node, cutoff)] += np.float32(self.alpha) * reaching_probability
 
-                continuation = (1.0 - self.alpha) * reaching_probability
+                continuation = (np.float32(1.0) - np.float32(self.alpha)) * reaching_probability
                 if continuation <= min_probability:
                     continue
                 for neighbor, time, transition in self._transitions(node, cutoff):
@@ -590,7 +590,7 @@ class TemporalPPR:
                 item[0][0],
             ),
         )[:top_l]
-        selected_total = sum(score for _, score in ranked)
+        selected_total = np.sum([score for _, score in ranked], dtype=np.float32)
         if selected_total == 0.0:
             return []
 
@@ -723,7 +723,7 @@ class TemporalPPR:
         fully connected transformation with time encoding.
 
         Returns:
-            ``(embedding, influences)``. The embedding is an empty float64
+            ``(embedding, influences)``. The embedding is an empty float32
             vector when the source has no historical interactions.
         """
         influences = self.top_neighbors(
@@ -753,25 +753,25 @@ def aggregate_temporal_features(
 ):
     """Apply normalized T-PPR weights to transformed temporal features."""
     if not influences:
-        return np.empty(0, dtype=np.float64)
+        return np.empty(0, dtype=np.float32)
 
     result = None
     expected_shape = None
     for influence in influences:
         vector = np.asarray(
             feature(influence.node, influence.time),
-            dtype=np.float64,
+            dtype=np.float32,
         )
         if transform is not None:
             vector = np.asarray(
                 transform(vector, query_time - influence.time),
-                dtype=np.float64,
+                dtype=np.float32,
             )
         if vector.ndim != 1:
             raise ValueError("transformed temporal features must be vectors")
         if expected_shape is None:
             expected_shape = vector.shape
-            result = np.zeros(expected_shape, dtype=np.float64)
+            result = np.zeros(expected_shape, dtype=np.float32)
         elif vector.shape != expected_shape:
             raise ValueError("transformed temporal features must have equal widths")
         result += influence.weight * vector

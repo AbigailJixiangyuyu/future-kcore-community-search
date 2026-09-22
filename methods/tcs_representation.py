@@ -30,12 +30,12 @@ class TCSStreamingIndex:
 
         self.snapshots = snapshots
         self.kmax = kmax
-        self.alpha = float(alpha)
+        self.alpha = np.float32(alpha)
         self.current_time = -1
-        self.weight_sum = 0.0
-        self._ks = np.arange(1, kmax + 1, dtype=np.float64)
+        self.weight_sum = np.float32(0.0)
+        self._ks = np.arange(1, kmax + 1, dtype=np.float32)
         self._penalties = np.zeros(
-            (self._INITIAL_CAPACITY, kmax), dtype=np.float64
+            (self._INITIAL_CAPACITY, kmax), dtype=np.float32
         )
         self._last_times = np.full(
             self._INITIAL_CAPACITY, -1, dtype=np.int32
@@ -52,7 +52,7 @@ class TCSStreamingIndex:
         if capacity <= node:
             return
 
-        penalties = np.zeros((capacity, self.kmax), dtype=np.float64)
+        penalties = np.zeros((capacity, self.kmax), dtype=np.float32)
         penalties[:len(self._penalties)] = self._penalties
         last_times = np.full(capacity, -1, dtype=np.int32)
         last_times[:len(self._last_times)] = self._last_times
@@ -65,7 +65,7 @@ class TCSStreamingIndex:
     def _apply_absent_steps(self, penalties, steps):
         if steps <= 0 or self.kmax == 0:
             return penalties
-        decay = self.alpha ** steps
+        decay = np.power(self.alpha, np.float32(steps))
         return (
             decay * penalties
             + (1.0 - decay) / (1.0 - self.alpha)
@@ -75,7 +75,7 @@ class TCSStreamingIndex:
         state = self._sparse_states.get(node)
         if state is None:
             penalties = np.full(
-                self.kmax, previous_weight_sum, dtype=np.float64
+                self.kmax, previous_weight_sum, dtype=np.float32
             )
         else:
             penalties = self._apply_absent_steps(
@@ -104,7 +104,7 @@ class TCSStreamingIndex:
         penalties = np.full(
             (len(nodes), self.kmax),
             previous_weight_sum,
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
         if self.kmax and np.any(observed):
@@ -112,7 +112,7 @@ class TCSStreamingIndex:
             observed_penalties = self._penalties[observed_nodes]
             absent_steps = time - last_times[observed] - 1
             decay = np.power(
-                self.alpha, absent_steps.astype(np.float64)
+                self.alpha, absent_steps.astype(np.float32)
             )[:, None]
             penalties[observed] = (
                 decay * observed_penalties
@@ -120,7 +120,7 @@ class TCSStreamingIndex:
             )
 
         if self.kmax:
-            coreness = coreness.astype(np.float64, copy=False)[:, None]
+            coreness = coreness.astype(np.float32, copy=False)[:, None]
             current_penalties = (
                 (self._ks[None, :] - coreness)
                 / np.maximum(self._ks[None, :], coreness)
@@ -152,7 +152,7 @@ class TCSStreamingIndex:
                 )
 
             previous_weight_sum = self.weight_sum
-            self.weight_sum = self.alpha * self.weight_sum + 1.0
+            self.weight_sum = self.alpha * self.weight_sum + np.float32(1.0)
 
             nodes = np.fromiter(core_dict.keys(), dtype=np.int64)
             coreness = np.fromiter(core_dict.values(), dtype=np.int64)
@@ -177,11 +177,11 @@ class TCSStreamingIndex:
             raise RuntimeError("advance_to must be called before querying")
         node = int(node)
         if self.kmax == 0:
-            return np.empty(0, dtype=np.float64)
+            return np.empty(0, dtype=np.float32)
 
         if self._is_dense_node(node):
             if node >= len(self._last_times) or self._last_times[node] < 0:
-                return np.zeros(self.kmax, dtype=np.float64)
+                return np.zeros(self.kmax, dtype=np.float32)
             last_time = int(self._last_times[node])
             if last_time < self.current_time:
                 self._penalties[node] = self._apply_absent_steps(
@@ -192,7 +192,7 @@ class TCSStreamingIndex:
         else:
             state = self._sparse_states.get(node)
             if state is None:
-                return np.zeros(self.kmax, dtype=np.float64)
+                return np.zeros(self.kmax, dtype=np.float32)
             penalties, last_time = state
             if last_time < self.current_time:
                 penalties = self._apply_absent_steps(
@@ -206,14 +206,14 @@ class TCSStreamingIndex:
         """Return TCS rows for ``nodes`` in the supplied order."""
         nodes = np.asarray(list(nodes), dtype=np.int64)
         if not len(nodes):
-            return np.empty((0, self.kmax), dtype=np.float64)
+            return np.empty((0, self.kmax), dtype=np.float32)
         if self.current_time < 0:
             raise RuntimeError("advance_to must be called before querying")
         if self.kmax == 0:
-            return np.empty((len(nodes), 0), dtype=np.float64)
+            return np.empty((len(nodes), 0), dtype=np.float32)
 
         representations = np.zeros(
-            (len(nodes), self.kmax), dtype=np.float64
+            (len(nodes), self.kmax), dtype=np.float32
         )
         dense_positions = np.flatnonzero(
             (nodes >= 0)
@@ -233,7 +233,7 @@ class TCSStreamingIndex:
                 stale = steps > 0
                 if np.any(stale):
                     decay = np.power(
-                        self.alpha, steps[stale].astype(np.float64)
+                        self.alpha, steps[stale].astype(np.float32)
                     )[:, None]
                     penalties[stale] = (
                         decay * penalties[stale]
@@ -268,7 +268,7 @@ def tcs_representation(snapshots, u, t, kmax, alpha=0.7):
         alpha: Exponential decay applied to older snapshots.
 
     Returns:
-        A float64 NumPy vector whose element at index ``k - 1`` is
+        A float32 NumPy vector whose element at index ``k - 1`` is
         ``TCS_t(k, u)``. The vector is empty when the observed ``kmax`` is zero.
     """
     if not isinstance(snapshots, Sequence):
@@ -293,11 +293,12 @@ def tcs_representation(snapshots, u, t, kmax, alpha=0.7):
     if kmax < 0:
         raise ValueError("kmax must be non-negative")
     if kmax == 0:
-        return np.empty(0, dtype=np.float64)
+        return np.empty(0, dtype=np.float32)
 
-    ks = np.arange(1, kmax + 1, dtype=np.float64)
-    cumulative_penalty = np.zeros(kmax, dtype=np.float64)
-    weight_sum = 0.0
+    ks = np.arange(1, kmax + 1, dtype=np.float32)
+    cumulative_penalty = np.zeros(kmax, dtype=np.float32)
+    weight_sum = np.float32(0.0)
+    alpha = np.float32(alpha)
 
     for snapshot in history:
         coreness = float(snapshot["core_dict"].get(u, 0))
@@ -305,6 +306,6 @@ def tcs_representation(snapshots, u, t, kmax, alpha=0.7):
         penalty = (ks - coreness) / denominators
         cumulative_penalty *= alpha
         cumulative_penalty += penalty
-        weight_sum = alpha * weight_sum + 1.0
+        weight_sum = alpha * weight_sum + np.float32(1.0)
 
     return 1.0 - cumulative_penalty / weight_sum
