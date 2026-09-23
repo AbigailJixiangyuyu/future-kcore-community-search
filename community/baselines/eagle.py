@@ -18,11 +18,11 @@ from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
 from datasets.baseline_split import training_boundaries
 from datasets.dataset_builder import DEFAULT_TEST_RATIO, build_snapshots, load_time_slice_manifest
 from methods.eagle import DEFAULT_ROOT, load_predictor, load_runtime
-from zebra_community import PredictedGraph
+from community.baselines.baseline_graph import PredictedGraph
 
 
 VALID_KS = (3, 4, 5, 6, 7)
-DEFAULT_SLICES = Path(__file__).resolve().parent / "data/mooc/time_slices/step_43200_window_86400"
+DEFAULT_SLICES = Path(__file__).resolve().parents[2] / "data/mooc/time_slices/step_43200_window_86400"
 
 
 class EagleCommunityPredictor:

@@ -102,14 +102,14 @@ def _train(job, job_path):
             raise FileNotFoundError("SWIFT did not produce its trained checkpoint")
         _update(job_path, artifact=str(output), checkpoint=str(output / "best.pt"))
     elif method == "tfwaveformer":
-        _run([sys.executable, "-u", ROOT / "train_tfwaveformer.py", slices,
+        _run([sys.executable, "-u", "-m", "training.baselines.tfwaveformer", slices,
               "--output-dir", output, "--device", "cuda:0", "--epochs", "30",
               "--patience", "5", "--threads", "2"], ROOT, env=env)
         if not (output / "best.pt").is_file():
             raise FileNotFoundError("TFWaveFormer did not produce its trained checkpoint")
         _update(job_path, artifact=str(output), checkpoint=str(output / "best.pt"))
     elif method == "prism":
-        _run([sys.executable, "-u", ROOT / "train_prism.py", slices,
+        _run([sys.executable, "-u", "-m", "training.baselines.prism", slices,
               "--output-dir", output, "--device", "cuda:0", "--epochs", "10"],
              ROOT, env=env)
         if not (output / "best.pt").is_file():

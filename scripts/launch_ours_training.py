@@ -129,7 +129,7 @@ def run(run_dir):
             output = run_dir / (name + ".pt")
             log_path = run_dir / (name + ".log")
             command = [
-                sys.executable, "-u", str(ROOT / "train_coreness.py"), str(slices),
+                sys.executable, "-u", "-m", "training.ours", str(slices),
                 "--output", str(output), "--device", "cuda:0",
                 "--train-ratio", "0.7", "--val-ratio", "0.15",
             ]

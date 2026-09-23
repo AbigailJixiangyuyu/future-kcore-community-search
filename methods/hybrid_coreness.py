@@ -331,7 +331,7 @@ class HybridCorenessPredictor(nn.Module):
 
 
 def load_hybrid_coreness_model(checkpoint_path, device="cpu"):
-    """Load a model checkpoint written by ``train_coreness.py``."""
+    """Load a model checkpoint written by ``training.ours``."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     objective = checkpoint.get("objective", {})
     if objective.get("name") not in (

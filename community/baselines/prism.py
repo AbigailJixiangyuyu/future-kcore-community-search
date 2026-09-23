@@ -11,7 +11,7 @@ from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
                                     load_test_samples, non_empty_samples,
                                     require_fit_boundary, query_set_sha256)
 from methods.prism import load_predictor
-from zebra_community import historical_community_union
+from community.baselines.baseline_graph import historical_community_union
 
 
 def recover_component(candidate, edges, scores, q, k, threshold):

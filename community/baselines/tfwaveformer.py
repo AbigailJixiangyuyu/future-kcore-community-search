@@ -2,7 +2,7 @@
 """Predict next-snapshot communities from checkpoint-backed TFWaveFormer links."""
 
 import argparse
-from collections import defaultdict, deque
+from collections import defaultdict
 import json
 import time
 from pathlib import Path
@@ -15,42 +15,11 @@ from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
                                     require_fit_boundary, query_set_sha256)
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from methods.tfwaveformer import DEFAULT_ROOT, SnapshotEdges, load_runtime
+from community.baselines.baseline_graph import component_after_peeling
 
 
 KS = (3, 4, 5, 6, 7)
-DEFAULT_SLICES = Path(__file__).resolve().parent / "data/mooc/time_slices/step_43200_window_86400"
-
-
-def component_after_peeling(nodes, edges, q, k):
-    """Return q's connected component of the induced k-core graph."""
-    adjacency = {node: set() for node in nodes}
-    if q not in adjacency:
-        return frozenset()
-    for u, v in edges:
-        if u != v and u in adjacency and v in adjacency:
-            adjacency[u].add(v)
-            adjacency[v].add(u)
-    degree = {node: len(neighbors) for node, neighbors in adjacency.items()}
-    removed = set()
-    queue = deque(node for node, count in degree.items() if count < k)
-    while queue:
-        node = queue.popleft()
-        if node in removed:
-            continue
-        removed.add(node)
-        for neighbor in adjacency[node] - removed:
-            degree[neighbor] -= 1
-            if degree[neighbor] < k:
-                queue.append(neighbor)
-    if q in removed:
-        return frozenset()
-    visited = {q}
-    queue = deque([q])
-    while queue:
-        for neighbor in adjacency[queue.popleft()] - removed - visited:
-            visited.add(neighbor)
-            queue.append(neighbor)
-    return frozenset(visited)
+DEFAULT_SLICES = Path(__file__).resolve().parents[2] / "data/mooc/time_slices/step_43200_window_86400"
 
 
 class TFWaveFormerCommunityPredictor:

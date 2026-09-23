@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """SWIFT next-snapshot community query/evaluation, using historical edges only."""
 import argparse
-from collections import deque
 import json
 
 from datasets.community_eval_builder import set_metrics
@@ -10,6 +9,7 @@ from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
                                     require_fit_boundary, query_set_sha256)
 from datasets.dataset_builder import build_snapshots
 from methods.swift_snapshot import load_predictor
+from community.baselines.baseline_graph import component_from_adjacency
 
 
 class SwiftCommunity:
@@ -64,27 +64,7 @@ class SwiftCommunity:
                 if score >= self.threshold:
                     neighbors[u].add(v)
                     neighbors[v].add(u)
-        degree = {node: len(adj) for node, adj in neighbors.items()}
-        removed = set()
-        queue = deque(node for node, d in degree.items() if d < k)
-        while queue:
-            node = queue.popleft()
-            if node in removed:
-                continue
-            removed.add(node)
-            for other in neighbors[node]:
-                degree[other] -= 1
-                if other not in removed and degree[other] < k:
-                    queue.append(other)
-        if q in removed:
-            return frozenset()
-        visited = {q}
-        queue = deque([q])
-        while queue:
-            for other in neighbors[queue.popleft()] - removed - visited:
-                visited.add(other)
-                queue.append(other)
-        return frozenset(visited)
+        return component_from_adjacency(neighbors, q, k)
 
 
 def main():

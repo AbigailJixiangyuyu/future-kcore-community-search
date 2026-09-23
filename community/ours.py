@@ -40,7 +40,7 @@ from methods.coreness_edge_generation import generate_predicted_edges
 from methods.tcs_representation import TCSStreamingIndex
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SLICES = ROOT / "data/mooc/time_slices/step_43200_window_86400"
 DEFAULT_BATCH_SIZE = 512
 EVALUATION_KS = (3, 4, 5, 6, 7)

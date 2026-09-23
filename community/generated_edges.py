@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-from hybrid_community import (
+from community.ours import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_SLICES,
     EVALUATION_KS,

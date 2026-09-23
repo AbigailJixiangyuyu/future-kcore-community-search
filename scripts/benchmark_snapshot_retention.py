@@ -20,7 +20,7 @@ import torch
 
 from datasets.dataset_builder import build_snapshots
 from datasets.snapshot_store import open_snapshot_store
-from hybrid_community import HybridCommunityPredictor
+from community.ours import HybridCommunityPredictor
 from methods.hybrid_coreness import load_hybrid_coreness_model
 from methods.t_ppr import TemporalPPR
 
@@ -60,7 +60,7 @@ def worker(args):
             keywords["streaming_only"] = args.mode != "eager"
             return TemporalPPR(*positional, **keywords)
 
-        with patch("hybrid_community.TemporalPPR", side_effect=tppr_factory):
+        with patch("community.ours.TemporalPPR", side_effect=tppr_factory):
             predictor = HybridCommunityPredictor(
                 snapshots, model, checkpoint, hmax=hmax, device="cpu"
             )
