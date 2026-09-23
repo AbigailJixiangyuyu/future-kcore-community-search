@@ -123,8 +123,7 @@ macro means use this independent valid set, audited by `core_ratio_valid_samples
 `core_ratio_empty_samples`, and cumulative `case3_lowered_node_count`.
 
 The historical-neighbor and T-PPR capacity-40 ablation entry points were
-removed on 2026-09-16. Historical reports remain in `docs/archive/`;
-their retired commands are not supported by the current code.
+removed on 2026-09-16; their retired commands are not supported by the current code.
 
 The independent `generated_edge_community.py` script first selects nodes by
 q-rooted BFS through nodes with predicted coreness >= k on the full historical
@@ -170,10 +169,6 @@ It returns these nodes and edges
 directly, without k-core peeling, further connectivity filtering, or removing
 isolates. Edge generation reuses the BFS predictions, not global inference.
 It does not change the existing hybrid threshold-BFS command.
-See the [Ours workflow](docs/ours-community-prediction-workflow.md)
-and [archived edge generation rules](docs/archive/生成边.md).
-See the [archived MOOC/email T-PPR capacity 20 vs 40 report](docs/archive/tppr-capacity20-vs40-mooc-email-20260910.md)
-for full evaluation results, per-K metrics, lowering ratios, and timing tradeoffs.
 
 ```bash
 python generated_edge_community.py 413 7 52 \
@@ -210,8 +205,7 @@ Progressive evaluation reports historical candidate-edge counts, not all-pairs
 counts. Result JSON identifies the full-history, historical-edges-only policy.
 
 The previous sliding-window/all-pairs Zebra implementation and its email rho
-runner were removed on 2026-09-16. The rho experiment report remains in
-`docs/archive/` as a historical record, not a runnable current protocol.
+runner were removed on 2026-09-16.
 
 ```bash
 # t is the zero-based coreness snapshot index
@@ -483,15 +477,11 @@ sample limit is used, nodes are stratified by their observable current
 coreness, including a group for historically seen but currently absent nodes;
 future labels are never used for sampling.
 
-The current architecture is documented in detail in
-[`docs/current-coreness-model-architecture.md`](docs/current-coreness-model-architecture.md).
-
 Structure pooling now uses only path B: set attention followed by
 query-conditioned pooling and LayerNorm. T-PPR weights remain an attention
 score prior. Path A and the pooling CLI selector have been removed.
 Only checkpoints explicitly marked with `structure_pooling="b"` are compatible
-with this pooling design. The historical node-only comparison is documented in
-[`structure pooling results`](docs/archive/model-experiments/structure-pooling-ablation-results.md).
+with this pooling design.
 
 Fusion now uses only `[Q,S]`: `Linear(128,128)` followed by two ordinary
 residual MLP blocks and the 32-dimensional state projection. Four-term
@@ -508,13 +498,7 @@ Always use a separate `--output` for experimental models.
 
 The GRU receives only trainable coreness embeddings, with missing history
 mapped to coreness 0. The unsuccessful structure-history input experiment and
-its CLI flag have been removed; its
-[results](docs/archive/model-experiments/structure-history-ablation-results.md) remain as a historical record.
-
-See [history encoder results](docs/archive/model-experiments/history-encoder-ablation-results.md)
-for the historical encoder comparison protocol and results; its runner has
-been removed. The completed
-[`Lag ablation`](docs/archive/model-experiments/lag-ablation-results.md) is retained as an experiment record.
+its CLI flag have been removed.
 
 The only output head is `Linear(32, kmax+1)` after
 the existing 128-to-32 state projection. Its weights are initially copied from
@@ -530,8 +514,6 @@ and were deleted along with obsolete local experiment artifacts. Wiki requires
 retraining before use with the current predictor. Old unversioned Hybrid state
 caches were also deleted; the next run rebuilds them with the current identity.
 Reusable snapshot/sample caches and Zebra state caches remain intact.
-See [historical output-head results](docs/archive/model-experiments/output-head-ablation-results.md);
-archived commands describe retired versions, not the current code.
 
 For inference, `hybrid_community.py` builds one cumulative adjacency and T-PPR
 state through the query time. It predicts `q` first, then deduplicates each BFS
@@ -556,9 +538,6 @@ examined nodes and new model predictions.
 
 Snapshots, test samples, and persisted evaluation sets are cached inside the
 specific `time_slices/step_<step>_window_<window>/` directory that produced them.
-
-The Hybrid and Zebra comparison on MOOC and WikiTalk is documented in
-the [archived community evaluation report](docs/archive/community-evaluation-results.md).
 
 ## Data Format
 

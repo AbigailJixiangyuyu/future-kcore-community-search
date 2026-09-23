@@ -1,11 +1,9 @@
-# Dataset-specific raw data and generated artifacts
-data/*/*.csv
-data/*/*.tsv
-data/*/*.txt
-data/*/snapshot_cache/
-data/*/sample_cache/
-data/*/community_eval/
-data/*/time_slices/
+# Local datasets and all generated data artifacts
+/data/
+
+# Local-only tests and documentation
+/tests/
+/docs/
 
 # Python bytecode and tooling
 __pycache__/
@@ -19,6 +17,9 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
+.env.*
+!.env.example
 .idea/
 .vscode/
 .agents/
@@ -29,9 +30,11 @@ checkpoints/
 outputs/
 runs/
 wandb/
-# Local experiment metrics, logs, and other generated artifacts.
-# Keep curated experiment reports in docs/ under version control.
+# Local experiment metrics, logs, and other generated artifacts
 /results/
+/model_cache/
+/logs/
+*.log
 *.pt
 *.pth
 *.ckpt
