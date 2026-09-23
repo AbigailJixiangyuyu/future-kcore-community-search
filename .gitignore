@@ -4,6 +4,8 @@
 # Local-only tests and documentation
 /tests/
 /docs/
+/AGENTS.md
+/AGENT.md
 
 # Python bytecode and tooling
 __pycache__/
