@@ -4,7 +4,7 @@ from pathlib import Path
 import hashlib
 import json
 
-from datasets.baseline_split import test_start_t
+from datasets.baseline_split import test_start_t, training_boundaries
 from datasets.community_eval_builder import load_community_eval_dataset
 from datasets.dataset_builder import load_time_slice_manifest
 
@@ -19,9 +19,35 @@ def require_fit_boundary(fit_end_t, snapshot_count):
     return start
 
 
+def evaluation_start_t(snapshot_count):
+    """First current snapshot in the final 15% evaluation window."""
+    start = int(snapshot_count * 0.85)
+    if not test_start_t(snapshot_count) <= start < snapshot_count - 1:
+        raise ValueError("final 15% contains no next-snapshot queries")
+    return start
+
+
+def baseline_training_split(snapshot_count):
+    """Describe the unchanged training protocol of the saved baselines."""
+    train_end, fit_end = training_boundaries(snapshot_count)
+    return {
+        "split_rule": "snapshot_55_15_30_v1",
+        "train_ratio": 0.55,
+        "val_ratio": 0.15,
+        "test_ratio": 0.30,
+        "train_end_t": train_end,
+        "fit_end_t": fit_end,
+    }
+
+
 def query_set_sha256(samples):
     queries = sorted((int(s["query"]), int(s["k"]), int(s["t"])) for s in samples)
     return hashlib.sha256(json.dumps(queries).encode("ascii")).hexdigest()
+
+
+def non_empty_samples(samples):
+    """Select the shared evaluation cohort without empty ground truth."""
+    return [sample for sample in samples if sample["community"]]
 
 
 def load_test_samples(slices_dir, snapshot_count, path=None):

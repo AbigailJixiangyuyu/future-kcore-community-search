@@ -12,7 +12,10 @@ import numpy as np
 from scipy import sparse
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import load_test_samples, require_fit_boundary
+from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
+                                    load_test_samples, non_empty_samples,
+                                    query_set_sha256, require_fit_boundary)
+from datasets.baseline_split import training_boundaries
 from datasets.dataset_builder import DEFAULT_TEST_RATIO, build_snapshots, load_time_slice_manifest
 from methods.eagle import DEFAULT_ROOT, load_predictor, load_runtime
 from zebra_community import PredictedGraph
@@ -128,7 +131,7 @@ def evaluate(predictor, *, slices_dir, start_t=None, max_samples=None, seed=42):
     snapshots = predictor.snapshots
     manifest = load_time_slice_manifest(slices_dir)
     split_t = int(len(snapshots) * (1 - DEFAULT_TEST_RATIO))
-    start_t = max(split_t, predictor.scorer.config.fit_end_t or 0) if start_t is None else start_t
+    start_t = evaluation_start_t(len(snapshots)) if start_t is None else start_t
     if not split_t <= start_t < len(snapshots) - 1:
         raise ValueError("start_t must be in held-out range")
     if predictor.scorer.config.fit_end_t is not None and start_t < predictor.scorer.config.fit_end_t:
@@ -137,7 +140,7 @@ def evaluate(predictor, *, slices_dir, start_t=None, max_samples=None, seed=42):
         raise ValueError("max_samples must be positive")
     # Truth is read only for scoring, never handed to the predictor.
     samples = load_test_samples(slices_dir, len(snapshots))
-    samples = [sample for sample in samples if sample["t"] >= start_t]
+    samples = non_empty_samples(sample for sample in samples if sample["t"] >= start_t)
     if max_samples is not None:
         samples = samples[:max_samples]
     grouped = defaultdict(list)
@@ -161,15 +164,14 @@ def evaluate(predictor, *, slices_dir, start_t=None, max_samples=None, seed=42):
                   "samples": len(values)} for k, values in sorted(rows.items())}
     return {
         "dataset": manifest["dataset"], "start_t": start_t,
+        "sample_scope": "shared_community_eval_non_empty_only",
         "fit_end_t": predictor.scorer.config.fit_end_t, "threshold": predictor.threshold,
         "candidate_history": "union_of_q_historical_k_core_communities_through_t",
         "edge_candidates": "historical_undirected_edges_within_candidate_through_t",
         "samples": len(samples), "per_k": per_k,
         "macro": {field: float(np.mean([row[field] for row in per_k.values()]))
                   for field in fields} if per_k else {},
-        "query_set_sha256": hashlib.sha256(json.dumps(sorted(
-            (int(s["query"]), int(s["k"]), int(s["t"])) for s in samples
-        )).encode()).hexdigest(),
+        "query_set_sha256": query_set_sha256(samples),
     }
 
 
@@ -209,10 +211,16 @@ def main(argv=None):
     else:
         require_fit_boundary(scorer.config.fit_end_t, len(snapshots))
         run_path = Path(args.config).parent / "run.json"
-        if not run_path.is_file() or json.loads(run_path.read_text()).get("split_rule") != "snapshot_55_15_30_v1":
+        run = json.loads(run_path.read_text()) if run_path.is_file() else {}
+        train_end_t, fit_end_t = training_boundaries(len(snapshots))
+        if (run.get("split_rule") not in (
+                "snapshot_55_15_30_v1", "snapshot_55_15_30_v1; equal times stay together")
+                or run.get("train_end_t") != train_end_t
+                or run.get("test_start_t") != fit_end_t):
             raise ValueError("EAGLE checkpoint lacks verified 7:3 snapshot training split")
         result = evaluate(predictor, slices_dir=args.slices_dir, start_t=args.start_t,
                           max_samples=args.max_samples)
+        result["training_split"] = baseline_training_split(len(snapshots))
     text = json.dumps(result, indent=2)
     if args.command == "eval" and args.output:
         with args.output.open("x", encoding="utf-8") as handle:

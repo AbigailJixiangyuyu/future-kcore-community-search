@@ -6,6 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
+from datasets.baseline_eval import evaluation_start_t
+from datasets.baseline_split import training_boundaries
 from methods.t_ppr import TemporalPPR
 from methods.h_index_representation import (
     validated_structure_distributions,
@@ -187,7 +189,7 @@ def _sample_by_current_coreness(nodes, current_core, limit, seed):
 
 
 def prediction_time_splits(snapshot_count, train_ratio=0.7, val_ratio=0.15):
-    """Split target snapshots chronologically into train, validation, and test."""
+    """Split by current time t, with each label taken from snapshot t+1."""
     if snapshot_count < 4:
         raise ValueError("coreness prediction requires at least four snapshots")
     if not 0.0 < train_ratio < 1.0:
@@ -197,23 +199,45 @@ def prediction_time_splits(snapshot_count, train_ratio=0.7, val_ratio=0.15):
     if train_ratio + val_ratio >= 1.0:
         raise ValueError("train_ratio + val_ratio must be less than 1")
 
-    # The split is based on target snapshot t+1, so no target snapshot appears
-    # in more than one split. Snapshot zero is history only.
-    train_end = max(2, int(snapshot_count * train_ratio))
-    val_end = max(train_end + 1, int(snapshot_count * (train_ratio + val_ratio)))
-    val_end = min(val_end, snapshot_count - 1)
-    if val_end <= train_end:
-        raise ValueError("not enough snapshots for a validation interval")
+    if train_ratio == 0.55 and val_ratio == 0.15:
+        train_end, fit_end = training_boundaries(snapshot_count)
+    elif train_ratio == 0.7 and val_ratio == 0.15:
+        train_end = int(snapshot_count * train_ratio) - 1
+        fit_end = evaluation_start_t(snapshot_count)
+        if not 1 <= train_end < fit_end:
+            raise ValueError("not enough snapshots for nonempty train/val/test splits")
+    else:
+        train_end = int(snapshot_count * train_ratio) - 1
+        fit_end = int(snapshot_count * (train_ratio + val_ratio))
+        if not 1 <= train_end < fit_end < snapshot_count - 1:
+            raise ValueError("not enough snapshots for nonempty train/val/test splits")
 
-    current_times = range(snapshot_count - 1)
     return {
-        "train": [time for time in current_times if time + 1 < train_end],
-        "val": [
-            time
-            for time in current_times
-            if train_end <= time + 1 < val_end
-        ],
-        "test": [time for time in current_times if time + 1 >= val_end],
+        "train": list(range(train_end)),
+        "val": list(range(train_end, fit_end)),
+        "test": list(range(fit_end, snapshot_count - 1)),
+    }
+
+
+def prediction_split_config(snapshot_count, train_ratio=0.7, val_ratio=0.15):
+    """Record the actual query-time boundaries used to prepare Ours samples."""
+    times = prediction_time_splits(snapshot_count, train_ratio, val_ratio)
+    train_end_t = times["val"][0]
+    fit_end_t = times["test"][0]
+    if (train_ratio, val_ratio) == (0.7, 0.15):
+        split_rule = "snapshot_70_15_15_current_query_v1"
+    elif (train_ratio, val_ratio) == (0.55, 0.15):
+        split_rule = "snapshot_55_15_30_v1"
+    else:
+        split_rule = "custom_snapshot_split_v1"
+    return {
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "split_rule": split_rule,
+        "snapshot_count": snapshot_count,
+        "train_end_t": train_end_t,
+        "fit_end_t": fit_end_t,
+        "first_test_target_t": fit_end_t + 1,
     }
 
 

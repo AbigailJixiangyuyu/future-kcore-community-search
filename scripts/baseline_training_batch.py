@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run twenty 7:3 baseline trainings sequentially on one GPU."""
+"""Run selected 7:3 baseline trainings sequentially on one GPU."""
 
 import argparse
 from datetime import datetime, timezone
@@ -18,11 +18,14 @@ WORKSPACE = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DATASETS = {
-    "lastfm": "step_604800_window_2419200",
-    "reddit": "step_86400_window_259200",
-    "sx-askubuntu": "step_604800_window_2419200",
-    "sx-superuser": "step_604800_window_2419200",
+    "lastfm": ("lastfm", "step_604800_window_2419200"),
+    "reddit": ("reddit", "step_86400_window_259200"),
+    "sx-askubuntu": ("sx-askubuntu", "step_604800_window_2419200"),
+    "sx-superuser": ("sx-superuser", "step_604800_window_2419200"),
+    "mooc": ("mooc", "step_43200_window_86400"),
+    "email": ("email-Eu-core-temporal", "step_302400_window_604800"),
 }
+DEFAULT_DATASETS = ("lastfm", "reddit", "sx-askubuntu", "sx-superuser")
 METHODS = ("eagle", "zebra", "swift", "tfwaveformer", "prism")
 MIN_FREE_BYTES = 4 * 1024 ** 3
 
@@ -161,18 +164,31 @@ def run_batch(batch):
         finished_at=datetime.now(timezone.utc).isoformat())
 
 
-def launch():
+def _select(requested, available, label):
+    selected = tuple(requested) if requested else tuple(available)
+    unknown = sorted(set(selected) - set(available))
+    if unknown:
+        raise ValueError("unknown {}: {}".format(label, ", ".join(unknown)))
+    if len(set(selected)) != len(selected):
+        raise ValueError("duplicate {} selection".format(label))
+    return selected
+
+
+def launch(dataset_names=None, method_names=None):
     from datasets.baseline_eval import load_test_samples
     from datasets.baseline_split import test_start_t
     from datasets.dataset_builder import load_time_slice_manifest
     import torch
 
     if not torch.cuda.is_available():
-        raise RuntimeError("cuda:0 is required for all twenty training jobs")
+        raise RuntimeError("cuda:0 is required for all training jobs")
 
+    dataset_names = _select(dataset_names, DATASETS, "dataset")
+    method_names = _select(method_names, METHODS, "method")
     counts = {}
-    for name, configuration in DATASETS.items():
-        slices = ROOT / "data" / name / "time_slices" / configuration
+    for name in dataset_names:
+        source_name, configuration = DATASETS[name]
+        slices = ROOT / "data" / source_name / "time_slices" / configuration
         manifest = load_time_slice_manifest(slices)
         count = len(manifest["slices"])
         load_test_samples(slices, count)
@@ -184,7 +200,7 @@ def launch():
     (batch / "jobs").mkdir()
     (batch / "logs").mkdir()
     jobs = []
-    for method in METHODS:
+    for method in method_names:
         for dataset, (slices, count, start) in counts.items():
             name = "{}__{}".format(method, dataset)
             path = batch / "jobs" / (name + ".json")
@@ -196,6 +212,7 @@ def launch():
             jobs.append(path)
     manifest_path = batch / "manifest.json"
     _write_json(manifest_path, dict(protocol="snapshot_55_15_30_v1",
+                datasets=list(dataset_names), methods=list(method_names),
                 jobs=[str(job) for job in jobs], status="scheduled",
                 created_at=datetime.now(timezone.utc).isoformat()))
     with (batch / "supervisor.log").open("ab", buffering=0) as log:
@@ -219,13 +236,17 @@ def status(batch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("launch")
+    launch_parser = sub.add_parser("launch")
+    launch_parser.add_argument("--datasets", nargs="+", choices=sorted(DATASETS),
+                               default=list(DEFAULT_DATASETS))
+    launch_parser.add_argument("--methods", nargs="+", choices=sorted(METHODS),
+                               default=list(METHODS))
     sub.add_parser("run-batch").add_argument("batch")
     sub.add_parser("worker").add_argument("job")
     sub.add_parser("status").add_argument("batch")
     args = parser.parse_args()
     if args.command == "launch":
-        launch()
+        launch(args.datasets, args.methods)
     elif args.command == "run-batch":
         run_batch(args.batch)
     elif args.command == "worker":

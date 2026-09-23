@@ -24,7 +24,9 @@ from datasets.community_eval_builder import (
     set_metrics,
 )
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
-from datasets.baseline_eval import load_test_samples, require_fit_boundary
+from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
+                                    load_test_samples, non_empty_samples,
+                                    query_set_sha256, require_fit_boundary)
 from methods.zebra_history_cache import ZebraHistoryCache
 
 
@@ -1268,14 +1270,11 @@ def _evaluate(args):
     manifest = load_time_slice_manifest(args.slices_dir)
     dataset_name = manifest["dataset"]
     split_t = _verified_snapshot_split(predictor, args.zebra_dataset)
-    start_t = split_t if args.start_t is None else args.start_t
+    start_t = evaluation_start_t(len(predictor.snapshots)) if args.start_t is None else args.start_t
     if not split_t <= start_t < len(predictor.snapshots) - 1:
         raise ValueError("evaluation start outside the shared held-out range")
     samples = load_test_samples(args.slices_dir, len(predictor.snapshots))
-    samples = [
-        sample for sample in samples
-        if sample["t"] >= start_t
-    ]
+    samples = non_empty_samples(sample for sample in samples if sample["t"] >= start_t)
     if args.max_samples is not None:
         samples = samples[:args.max_samples]
 
@@ -1339,14 +1338,14 @@ def _evaluate(args):
         **TIMING_SCHEMA,
         "dataset": dataset_name,
         "start_t": start_t,
+        "training_split": baseline_training_split(len(predictor.snapshots)),
         "threshold": predictor.threshold,
         **predictor.candidate_metadata,
         "samples": len(samples),
+        "sample_scope": "shared_community_eval_non_empty_only",
         "candidate_size_mean": float(np.mean(candidate_sizes, dtype=np.float32)) if samples else 0.0,
         "candidate_size_max": max(candidate_sizes, default=0),
-        "query_set_sha256": hashlib.sha256(json.dumps(sorted(
-            (int(s["query"]), int(s["k"]), int(s["t"])) for s in samples
-        )).encode("ascii")).hexdigest(),
+        "query_set_sha256": query_set_sha256(samples),
         "per_k": per_k,
         "macro": macro,
         "load_s": load_s,

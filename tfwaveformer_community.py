@@ -10,7 +10,9 @@ from pathlib import Path
 import numpy as np
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import load_test_samples, require_fit_boundary, query_set_sha256
+from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
+                                    load_test_samples, non_empty_samples,
+                                    require_fit_boundary, query_set_sha256)
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from methods.tfwaveformer import DEFAULT_ROOT, SnapshotEdges, load_runtime
 
@@ -144,7 +146,8 @@ def evaluate(predictor, samples, *, start_t, max_samples=None):
     evaluation_boundary(predictor.link_predictor, len(predictor.snapshots), start_t)
     if max_samples is not None and max_samples <= 0:
         raise ValueError("max_samples must be positive")
-    selected = [s for s in samples if s["t"] >= start_t and s["k"] in KS]
+    selected = non_empty_samples(
+        s for s in samples if s["t"] >= start_t and s["k"] in KS)
     if max_samples is not None:
         selected = selected[:max_samples]
     rows = defaultdict(list)
@@ -164,6 +167,7 @@ def evaluate(predictor, samples, *, start_t, max_samples=None):
     ) for k, group in sorted(rows.items())}
     return {
         "samples": len(per_sample), "start_t": start_t,
+        "sample_scope": "shared_community_eval_non_empty_only",
         "query_set_sha256": query_set_sha256(selected),
         "candidate_protocol": "historical_q_k_community_union_and_historical_edges",
         "threshold": predictor.threshold, "per_k": per_k,
@@ -234,13 +238,15 @@ def main(argv=None):
     else:
         manifest = load_time_slice_manifest(args.slices_dir)
         start_t, boundary_source = evaluation_boundary(
-            link, len(snapshots), args.start_t,
+            link, len(snapshots),
+            evaluation_start_t(len(snapshots)) if args.start_t is None else args.start_t,
         )
         require_fit_boundary(link.fit_end_t, len(snapshots))
         samples = load_test_samples(args.slices_dir, len(snapshots))
         result = evaluate(predictor, samples, start_t=start_t,
                           max_samples=args.max_samples)
         result["dataset"] = manifest["dataset"]
+        result["training_split"] = baseline_training_split(len(snapshots))
         result["boundary_source"] = boundary_source
         result["training_scope"] = (
             "smoke_only" if link.training_metadata is not None

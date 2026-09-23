@@ -5,7 +5,9 @@ from collections import deque
 import json
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import load_test_samples, require_fit_boundary, query_set_sha256
+from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
+                                    load_test_samples, non_empty_samples,
+                                    require_fit_boundary, query_set_sha256)
 from datasets.dataset_builder import build_snapshots
 from methods.swift_snapshot import load_predictor
 
@@ -99,6 +101,7 @@ def main():
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("samples", help="prebuilt community_eval/<dataset>.pkl")
     evaluate.add_argument("--limit", type=int, default=None)
+    evaluate.add_argument("--start-t", type=int, help="first current snapshot to evaluate")
     args = parser.parse_args()
     snaps = build_snapshots(args.slices_dir)[0]
     predictor = load_predictor(args.slices_dir, args.checkpoint)
@@ -110,9 +113,13 @@ def main():
                           "community": sorted(result), "candidate_protocol": method.protocol}))
     else:
         require_fit_boundary(method.predictor.fit_end_t, len(snaps))
+        start_t = evaluation_start_t(len(snaps)) if args.start_t is None else args.start_t
+        if not method.predictor.fit_end_t <= start_t < len(snaps) - 1:
+            raise ValueError("evaluation start must follow validation and precede the final snapshot")
         samples = load_test_samples(args.slices_dir, len(snaps), args.samples)
-        samples = sorted((s for s in samples if method.predictor.fit_end_t <= s["t"]
-                          and 3 <= s["k"] <= 7), key=lambda s: s["t"])
+        samples = sorted(non_empty_samples(
+            s for s in samples if start_t <= s["t"]
+            and 3 <= s["k"] <= 7), key=lambda s: s["t"])
         if args.limit is not None:
             samples = samples[:args.limit]
         results = []
@@ -122,6 +129,9 @@ def main():
             prediction = method.predict(int(sample["query"]), int(sample["k"]), t)
             results.append(set_metrics(prediction, sample["community"]))
         print(json.dumps({"count": len(results), "candidate_protocol": method.protocol,
+                          "start_t": start_t,
+                          "training_split": baseline_training_split(len(snaps)),
+                          "sample_scope": "shared_community_eval_non_empty_only",
                           "query_set_sha256": query_set_sha256(samples),
                           "threshold": method.threshold,
                           "mean": {key: sum(item[key] for item in results) / len(results)

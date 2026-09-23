@@ -17,6 +17,7 @@ from datasets.coreness_prediction_builder import (
     STRUCTURE_TIME_REFERENCE,
     add_core_history_tokens,
     build_coreness_samples,
+    prediction_split_config,
     prepare_feature_arrays_by_split,
 )
 from datasets.dataset_builder import build_snapshots
@@ -78,7 +79,7 @@ def _model_batch(batch, structure_table, device):
 def _feature_cache_stem(kmax, hmax, config):
     max_nodes = config["max_nodes_per_time"]
     return (
-        f"hybrid_features_v9_float32_current_snapshot_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
+        f"hybrid_features_v9_float32_current_snapshot_tsplit_v2_k{kmax}_h{hmax}_n{max_nodes}_l{config['top_l']}_"
         f"ik{config['t_ppr_internal_top_k']}_"
         f"o{config['order']}_a{config['t_ppr_alpha']}_"
         f"b{config['t_ppr_beta']}_p{config['min_probability']}_"
@@ -273,6 +274,9 @@ def train(args):
         f"structure_buckets=0..{hmax - 1},>={hmax}"
     )
 
+    split_config = prediction_split_config(
+        len(snapshots), args.train_ratio, args.val_ratio
+    )
     samples = build_coreness_samples(
         snapshots,
         train_ratio=args.train_ratio,
@@ -301,6 +305,7 @@ def train(args):
         "max_nodes_per_time": args.max_nodes_per_time,
         "train_ratio": args.train_ratio,
         "val_ratio": args.val_ratio,
+        "split_rule": split_config["split_rule"],
         "seed": args.seed,
     }
     t_ppr = TemporalPPR(
@@ -435,10 +440,7 @@ def train(args):
             "positive_weight_power": args.ordinal_weight_power,
             "positive_weight_cap": args.ordinal_weight_cap,
         },
-        "split_config": {
-            "train_ratio": args.train_ratio,
-            "val_ratio": args.val_ratio,
-        },
+        "split_config": split_config,
         "training_config": {
             "seed": args.seed,
             "epochs": args.epochs,
@@ -458,6 +460,7 @@ def train(args):
             {
                 "objective": checkpoint["objective"],
                 "model_config": checkpoint["model_config"],
+                "split_config": checkpoint["split_config"],
                 "training_config": checkpoint["training_config"],
                 **checkpoint["metrics"],
             },
