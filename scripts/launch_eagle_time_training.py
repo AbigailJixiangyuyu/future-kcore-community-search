@@ -134,7 +134,7 @@ def launch(run, metadata):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("datasets", nargs="+", choices=sorted(DATASETS))
-    parser.add_argument("--eagle-root", type=Path, default=ROOT.parent / "EAGLE")
+    parser.add_argument("--eagle-root", type=Path, default=ROOT / "third_party" / "EAGLE")
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--gpu", type=int, default=0)

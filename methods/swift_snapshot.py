@@ -1,4 +1,4 @@
-"""Bridge the project's lazy snapshot cache to SWIFT's native runtime."""
+"""Bridge the project's lazy snapshot cache to the bundled SWIFT runtime."""
 import importlib.util
 from pathlib import Path
 import sys
@@ -8,7 +8,7 @@ import numpy as np
 from datasets.dataset_builder import build_snapshots
 
 
-SWIFT_ROOT = Path(__file__).resolve().parents[2] / "SWIFT"
+SWIFT_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "SWIFT"
 
 
 class SnapshotEdges:

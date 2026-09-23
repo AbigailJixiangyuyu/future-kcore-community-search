@@ -31,7 +31,7 @@ from methods.zebra_history_cache import ZebraHistoryCache
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_ZEBRA_ROOT = ROOT.parent / "Zebra"
+DEFAULT_ZEBRA_ROOT = ROOT / "third_party" / "Zebra"
 DEFAULT_SLICES = (
     ROOT / "data/mooc/time_slices/step_43200_window_86400"
 )

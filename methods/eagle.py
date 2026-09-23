@@ -9,7 +9,7 @@ import numpy as np
 from datasets.dataset_builder import build_snapshots
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "EAGLE"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "EAGLE"
 
 
 def load_runtime(root=DEFAULT_ROOT):

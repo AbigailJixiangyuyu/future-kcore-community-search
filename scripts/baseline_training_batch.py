@@ -14,7 +14,7 @@ import traceback
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parent
+BASELINES = ROOT / "third_party"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 DATASETS = {
@@ -64,14 +64,14 @@ def _train(job, job_path):
     if method == "eagle":
         from scripts.launch_eagle_time_training import prepare_run
 
-        run, metadata = prepare_run(dataset, WORKSPACE / "EAGLE", output.parent,
+        run, metadata = prepare_run(dataset, BASELINES / "EAGLE", output.parent,
                                     epochs=50, gpu=0)
         _update(job_path, artifact=str(run), checkpoint=metadata["checkpoint"])
         _run(metadata["command"][1:], run, env=env)
         if not Path(metadata["checkpoint"]).is_file():
             raise FileNotFoundError("EAGLE did not produce its trained checkpoint")
     elif method == "zebra":
-        zebra_root = WORKSPACE / "Zebra"
+        zebra_root = BASELINES / "Zebra"
         zebra_data = "{}-snapshot-7x3-{}".format(dataset, batch.name)
         _run([sys.executable, "-u", zebra_root / "utils/preprocess_time_slices.py",
               "--input", slices, "--data", zebra_data], ROOT, env=env)
@@ -94,8 +94,8 @@ def _train(job, job_path):
             raise FileNotFoundError("Zebra checkpoint and 7:3 sidecar were not produced")
         _update(job_path, checkpoint=str(sidecars[0])[:-len(".split.json")])
     elif method == "swift":
-        _run(["bash", WORKSPACE / "SWIFT/run_local.sh",
-              WORKSPACE / "SWIFT/snapshot_adapter.py", slices,
+        _run(["bash", BASELINES / "SWIFT/run_local.sh",
+              BASELINES / "SWIFT/snapshot_adapter.py", slices,
               "--output", output, "--model", "TGAT", "--epochs", "5"],
              ROOT, env=env)
         if not (output / "best.pt").is_file():

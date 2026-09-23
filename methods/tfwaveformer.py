@@ -1,4 +1,4 @@
-"""Bridge the sibling TFWaveFormer runtime without polluting models/utils imports."""
+"""Bridge the bundled TFWaveFormer runtime without polluting models/utils imports."""
 
 import importlib
 from pathlib import Path
@@ -10,7 +10,7 @@ import numpy as np
 from datasets.dataset_builder import build_snapshots
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "TFWaveFormer"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "TFWaveFormer"
 
 
 def load_runtime(root=DEFAULT_ROOT):

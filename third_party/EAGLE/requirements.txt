@@ -1,0 +1,8 @@
+# Python dependencies of the retained EAGLE snapshot training and inference code.
+# Install a matching CUDA build of PyTorch separately if GPU execution is needed.
+numpy
+pandas
+torch
+numba
+tqdm
+scikit-learn

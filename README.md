@@ -14,6 +14,13 @@ python hybrid_community.py query 413 7 52 --device cuda:0
 python zebra_community.py query 413 7 52 --device cuda:0
 ```
 
+Five link-prediction baselines (Zebra, EAGLE, SWIFT, TFWaveFormer, PRISM)
+are included under `third_party/`; this repository's `methods/` adapters and
+`*_community.py` entry points load them there by default. `scripts/baseline_training_batch.py`
+also trains against the included sources. Data, checkpoints, and native build
+artifacts are not included. SWIFT requires a CUDA build of its bundled DGL
+source; see `third_party/README.md` for the exact source and build boundaries.
+
 Hybrid streaming state can be checkpointed before evaluation without
 materializing model features. The default cache time is the 70% evaluation
 boundary; later `query` and `eval` commands automatically load the newest
@@ -113,7 +120,7 @@ included preparation, `bfs_selection_s` also included preparation, and batch
 fields directly to version-2 fields. No cache is cleared or model warmed up
 automatically for timing; report cache conditions when comparing cold and warm
 queries. These timing changes apply to our shared evaluator and its candidate
-variants, not the independent Zebra/HCU evaluators.
+variants, not the independent Zebra evaluator.
 
 `case3_lowered_node_ratio` is the number of distinct nodes lowered by case 3
 divided by all selected BFS community nodes. Repeated decreases of one node
@@ -216,8 +223,10 @@ python zebra_community.py eval --device cuda:0 \
   --output outputs/zebra_mooc_community.json
 ```
 
-The default MOOC paths use the converted `mooc-snapshot` data and its trained
-checkpoint in the sibling `Zebra` repository. The evaluation start is derived
+The default MOOC paths look for converted `mooc-snapshot` data and its trained
+checkpoint beneath `third_party/Zebra/`; these generated artifacts are not
+included in Git and must be prepared locally or supplied via CLI options.
+The evaluation start is derived
 from Zebra's 85% time boundary; for the current 60-snapshot MOOC data it is
 `t=52`, predicting snapshot 53 (Zebra timestamp 54).
 
@@ -283,12 +292,6 @@ layer. No additional k-core peeling is applied.
 **Zebra link prediction** — Predicts the next graph over q's historical
 community candidate set, then performs k-core decomposition and returns q's
 connected component.
-
-**HCU (Historical Community Union)** — Baseline that unions all historical
-k-core components containing q through the current snapshot.
-
-The former **StreamingTCS** community search method is archived under
-`archive/streaming_tcs/` and is not part of the active evaluation pipeline.
 
 For node-level temporal features, `methods.tcs_representation` provides
 `tcs_representation(snapshots, u, t, kmax)`. Snapshot preprocessing determines
@@ -641,7 +644,6 @@ methods/
   h_index_representation.py     # Multi-order structural features
   t_ppr.py                      # Temporal-neighbor influence queries
   hybrid_coreness.py            # Trainable fusion model + community recovery
-  hcu.py                        # Historical community union baseline
 datasets/
   dataset_builder.py            # Snapshot building + caching
   coreness_prediction_builder.py # Node samples and model feature tensors
@@ -655,8 +657,4 @@ data/
         snapshot_cache/         # Derived k-core snapshots
         sample_cache/           # Derived test samples
         community_eval/         # Optional persisted evaluation set
-archive/
-  analysis/                     # Historical edge-coverage analysis tool
-  streaming_tcs/                # Retired StreamingTCS implementation and evaluator
-  specs/                        # Archived historical change specifications
 ```

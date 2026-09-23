@@ -7,8 +7,7 @@ the next snapshot.
 ## Tech Stack
 
 Python 3, networkit, NumPy, PyTorch. Numba accelerates the active T-PPR
-implementation and is also used by the archived StreamingTCS experiment.
-Multiprocessing is retained by the archived StreamingTCS evaluator.
+implementation.
 
 ## Directory Structure
 
@@ -19,11 +18,12 @@ coreness-prediction/
 ├── zebra_community.py             # Zebra link-based community prediction
 ├── methods/
 │   ├── hybrid_coreness.py          # Coreness model + community recovery
-│   ├── tcs_representation.py       # Node-level temporal features
-│   └── hcu.py                      # HCU baseline (historical community union)
+│   └── tcs_representation.py       # Node-level temporal features
 ├── datasets/
 │   ├── dataset_builder.py         # Snapshot building + caching (networkit-based)
-│   ├── community_eval_builder.py  # Community test sample generation + caching
+│   └── community_eval_builder.py  # Community test sample generation + caching
+├── third_party/                    # Vendored Zebra, EAGLE, SWIFT, TFWaveFormer, PRISM sources
+│   └── SWIFT/swift-dgl/            # Modified DGL source needed for SWIFT native build
 ├── data/
 │   └── <dataset>/                 # Raw CSV and all generated data artifacts
 │       ├── <dataset>.csv          # Raw edges: u,v,ts
@@ -33,9 +33,6 @@ coreness-prediction/
 │               ├── snapshot_cache/  # Cached k-core snapshots
 │               ├── sample_cache/    # Cached test samples
 │               └── community_eval/  # Persisted evaluation set (optional)
-├── archive/streaming_tcs/         # Retired StreamingTCS code and evaluator
-├── archive/analysis/             # Historical standalone analysis tools
-├── archive/specs/                # Historical change specifications (archived)
 └── docs/                          # Project documentation
 ```
 
@@ -43,10 +40,10 @@ coreness-prediction/
 
 - **Hybrid coreness prediction** (`hybrid_community.py`): Traverse the cumulative graph from q, predict each new BFS frontier in batches, and expand only through nodes whose predicted next-snapshot coreness is at least k. Queries at the same time share node-level TCS, T-PPR influence, structure-feature, and predicted-coreness caches, so each touched node is featurized and inferred at most once per time slice. No k-core peeling is applied.
 - **Zebra community prediction** (`zebra_community.py`): Predict links over the historical community candidate set, run k-core decomposition, and return q's connected component.
-- **HCU** (`methods/hcu.py`): Union of q's historical k-core communities through the current snapshot.
+- **Other link baselines** (`{eagle,swift,tfwaveformer,prism}_community.py`): Use the vendored model code under `third_party/` and the shared snapshot/community evaluation adapters.
 
-StreamingTCS is retired. Its implementation and old comparison evaluator are
-available only under `archive/streaming_tcs/` for reproducibility.
+Retired methods and historical specifications are kept locally under the
+Git-ignored `archive/` directory, not distributed with the active experiments.
 
 ## TCS Formula
 
