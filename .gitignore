@@ -131,3 +131,6 @@ run_logs/
 /third_party/**/*.tgz
 *.o
 *.a
+
+
+nohup.out

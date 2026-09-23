@@ -6,8 +6,31 @@ Run with: bash run_local.sh smoke_test.py
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
+
+SWIFT_ROOT = Path(__file__).resolve().parent
+for directory in reversed((
+    SWIFT_ROOT / ".local-build/python",
+    SWIFT_ROOT / ".local-deps",
+    SWIFT_ROOT / "swift-dgl/python",
+    SWIFT_ROOT,
+)):
+    sys.path.insert(0, str(directory))
+os.environ.update(
+    DGLBACKEND="pytorch",
+    SWIFT_ALLOW_OLD_TORCH="1",
+    DGL_FFI="ctypes",
+    DGL_LIBRARY_PATH=str(SWIFT_ROOT / ".local-build/dgl"),
+)
+cuda_libraries = str(Path(os.environ.get("SWIFT_CUDA_ROOT", "/usr/local/cuda-11.1")) / "lib64")
+os.environ["LD_LIBRARY_PATH"] = cuda_libraries + (
+    ":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else ""
+)
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 import dgl
 import numpy as np

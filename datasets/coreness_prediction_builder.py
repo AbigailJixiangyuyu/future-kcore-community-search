@@ -489,16 +489,31 @@ def prepare_feature_arrays_by_split(
             shape=table_shape,
         )
     structure_table[0] = 0.0
+    absent_structure = np.zeros(structure_width, dtype=np.float32)
+    absent_structure[::hmax + 1] = 1.0
+    current_time = None
+    cached_rows = cached_values = None
     for structure_index, structure_key in enumerate(
         structure_keys[1:], start=1
     ):
         node, time = structure_key
-        structure_table[structure_index] = t_ppr.structure_feature(
-            node,
-            time,
-            order=order,
-            cmax=hmax,
-        ).astype(np.float32, copy=False)
+        if time != current_time:
+            cached_rows = cached_values = cached = None
+            if order == 4:
+                cached = validated_structure_distributions(snapshots[time], hmax)
+                if cached is not None:
+                    cached_rows = cached[0]["node_rows"]
+                    cached_values = cached[0]["values"]
+            current_time = time
+        if cached_rows is not None:
+            row = cached_rows.get(node)
+            structure_table[structure_index] = (
+                cached_values[row] if row is not None else absent_structure
+            )
+        else:
+            structure_table[structure_index] = t_ppr.structure_feature(
+                node, time, order=order, cmax=hmax
+            ).astype(np.float32, copy=False)
     if isinstance(structure_table, np.memmap):
         structure_table.flush()
     return arrays_by_split, structure_table
