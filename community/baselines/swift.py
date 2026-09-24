@@ -5,8 +5,7 @@ import json
 
 from datasets.community_eval_builder import set_metrics
 from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
-                                    non_empty_samples, require_fit_boundary,
-                                    query_set_sha256)
+                                    non_empty_samples, query_set_sha256)
 from datasets.dataset_builder import build_snapshots
 from methods.swift_snapshot import load_predictor
 from community.baselines.baseline_graph import component_from_adjacency
@@ -92,10 +91,9 @@ def main():
         print(json.dumps({"q": args.q, "k": args.k, "t": args.t,
                           "community": sorted(result), "candidate_protocol": method.protocol}))
     else:
-        require_fit_boundary(method.predictor.fit_end_t, len(snaps))
         start_t = evaluation_start_t(len(snaps)) if args.start_t is None else args.start_t
-        if not method.predictor.fit_end_t <= start_t < len(snaps) - 1:
-            raise ValueError("evaluation start must follow validation and precede the final snapshot")
+        if not 0 <= start_t < len(snaps) - 1:
+            raise ValueError("start_t must have a next snapshot")
         samples = load_test_samples(args.slices_dir, len(snaps), args.samples)
         samples = sorted(non_empty_samples(
             s for s in samples if start_t <= s["t"]

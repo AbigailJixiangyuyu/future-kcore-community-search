@@ -25,7 +25,9 @@ parser = argparse.ArgumentParser('Self-supervised training with diffusion models
 parser.add_argument('-d', '--data', type=str, help='Dataset name (eg. wikipedia or reddit)',default='wikipedia')
 parser.add_argument('--bs', type=int, default=200, help='Batch_size')
 parser.add_argument('--snapshot-count', type=int, default=None,
-                    help='use snapshot 55/15/30 split (inclusive train/validation targets)')
+                    help='use chronological snapshot split (inclusive train/validation targets)')
+parser.add_argument('--snapshot-split-rule', choices=('snapshot_55_15_30_v1',
+                    'snapshot_70_15_15_v1'), default='snapshot_70_15_15_v1')
 parser.add_argument('--n_degree', type=int, default=10, help='Number of neighbors to sample')
 parser.add_argument('--n_head', type=int, default=2, help='Number of heads used in attention layer')
 parser.add_argument('--n_epoch', type=int, default=50, help='Number of epochs')
@@ -124,7 +126,8 @@ logger.addHandler(ch)
 logger.info(args)
 
 
-full_data, full_train_data, full_val_data, test_data, new_node_val_data, new_node_test_data, n_nodes, n_edges = get_data(DATA, snapshot_count=args.snapshot_count)
+full_data, full_train_data, full_val_data, test_data, new_node_val_data, new_node_test_data, n_nodes, n_edges = get_data(
+  DATA, snapshot_count=args.snapshot_count, snapshot_split_rule=args.snapshot_split_rule)
 args.n_nodes = n_nodes +1
 args.n_edges = n_edges +1
 
@@ -299,11 +302,14 @@ for i in range(args.n_runs):
             for block in iter(lambda: checkpoint_file.read(1024 * 1024), b''):
               digest.update(block)
           Path(best_checkpoint_path + '.split.json').write_text(json.dumps({
-            'split_rule': 'snapshot_55_15_30_v1', 'snapshot_count': args.snapshot_count,
+            'split_rule': args.snapshot_split_rule, 'snapshot_count': args.snapshot_count,
             'dataset': args.data, 'checkpoint_sha256': digest.hexdigest(),
-            'train_end_t': int(args.snapshot_count * 0.55) - 1,
-            'fit_end_t': int(args.snapshot_count * 0.7),
-            'first_test_target_t': int(args.snapshot_count * 0.7) + 1,
+            'train_end_t': int(args.snapshot_count * (
+              0.7 if args.snapshot_split_rule == 'snapshot_70_15_15_v1' else 0.55)) - 1,
+            'fit_end_t': int(args.snapshot_count * (
+              0.85 if args.snapshot_split_rule == 'snapshot_70_15_15_v1' else 0.7)),
+            'first_test_target_t': int(args.snapshot_count * (
+              0.85 if args.snapshot_split_rule == 'snapshot_70_15_15_v1' else 0.7)) + 1,
           }) + '\n')
 
 

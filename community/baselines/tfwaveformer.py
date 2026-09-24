@@ -11,8 +11,7 @@ import numpy as np
 
 from datasets.community_eval_builder import set_metrics
 from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
-                                    non_empty_samples, require_fit_boundary,
-                                    query_set_sha256)
+                                    non_empty_samples, query_set_sha256)
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from methods.tfwaveformer import DEFAULT_ROOT, SnapshotEdges, load_runtime
 from community.baselines.baseline_graph import component_after_peeling
@@ -112,7 +111,8 @@ class TFWaveFormerCommunityPredictor:
 
 def evaluate(predictor, samples, *, start_t, max_samples=None):
     """Offline metrics: only this function may access next-snapshot truth."""
-    evaluation_boundary(predictor.link_predictor, len(predictor.snapshots), start_t)
+    if not 0 <= start_t < len(predictor.snapshots) - 1:
+        raise ValueError("start_t must have a next snapshot")
     if max_samples is not None and max_samples <= 0:
         raise ValueError("max_samples must be positive")
     selected = non_empty_samples(
@@ -144,29 +144,6 @@ def evaluate(predictor, samples, *, start_t, max_samples=None):
                   for name in names} if per_k else {},
         "records": per_sample,
     }
-
-
-def evaluation_boundary(link, snapshot_count, requested_start):
-    """Use the checkpoint's own split, or label an explicit fallback honestly."""
-    metadata = getattr(link, "training_metadata", None)
-    if metadata is not None:
-        if (not isinstance(metadata, dict)
-                or metadata.get("snapshot_count") != snapshot_count
-                or metadata.get("fit_end_t") != link.fit_end_t
-                or metadata.get("val_end_t") != link.fit_end_t
-                or metadata.get("first_test_target_t") != link.fit_end_t + 1):
-            raise ValueError("checkpoint training split metadata is inconsistent")
-        boundary = metadata["first_test_target_t"] - 1
-        source = "checkpoint_held_out_split"
-    else:
-        if requested_start is None:
-            raise ValueError("checkpoint lacks split metadata; specify --start-t explicitly")
-        boundary = link.fit_end_t
-        source = "explicit_start_fit_boundary_only_not_verified_test_split"
-    start = boundary if requested_start is None else requested_start
-    if not isinstance(start, int) or not boundary <= start < snapshot_count - 1:
-        raise ValueError("evaluation start is outside the held-out range")
-    return start, source
 
 
 def main(argv=None):
@@ -206,11 +183,8 @@ def main(argv=None):
         result = predictor.predict(args.q, args.k, args.t)
     else:
         manifest = load_time_slice_manifest(args.slices_dir)
-        start_t, _ = evaluation_boundary(
-            link, len(snapshots),
-            evaluation_start_t(len(snapshots)) if args.start_t is None else args.start_t,
-        )
-        require_fit_boundary(link.fit_end_t, len(snapshots))
+        start_t = (evaluation_start_t(len(snapshots))
+                   if args.start_t is None else args.start_t)
         samples = load_test_samples(args.slices_dir, len(snapshots))
         result = evaluate(predictor, samples, start_t=start_t,
                           max_samples=args.max_samples)

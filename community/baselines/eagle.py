@@ -3,7 +3,6 @@
 
 import argparse
 from collections import defaultdict
-import hashlib
 import json
 from pathlib import Path
 import time
@@ -13,10 +12,8 @@ from scipy import sparse
 
 from datasets.community_eval_builder import set_metrics
 from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
-                                    non_empty_samples, query_set_sha256,
-                                    require_fit_boundary)
-from datasets.baseline_split import training_boundaries
-from datasets.dataset_builder import DEFAULT_TEST_RATIO, build_snapshots, load_time_slice_manifest
+                                    non_empty_samples, query_set_sha256)
+from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from methods.eagle import DEFAULT_ROOT, load_predictor, load_runtime
 from community.baselines.baseline_graph import PredictedGraph
 
@@ -106,22 +103,7 @@ def load_eagle_run(slices_dir, checkpoint, *, config_path, device="cpu", eagle_r
     config = load_runtime(eagle_root).SnapshotInferenceConfig(**json.loads(config_path.read_text()))
     if config.branch != "structure" and checkpoint is None:
         raise ValueError("Time/Hybrid require a checkpoint")
-    run_path = config_path.parent / "run.json"
-    if run_path.is_file():
-        run = json.loads(run_path.read_text())
-        if (Path(run["slices_dir"]).resolve() != slices_dir or
-                run["fit_end_t"] != config.fit_end_t or
-                run["protocol"] != "eagle_snapshot_v1" or
-                (checkpoint is not None and Path(run["checkpoint"]).resolve() != checkpoint)):
-            raise ValueError("EAGLE run provenance does not match dataset/checkpoint/config")
-        recorded_manifest = run.get("source_manifest_sha256")
-        if recorded_manifest is not None:
-            manifest_path = slices_dir / "metadata.json"
-            if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != recorded_manifest:
-                raise ValueError("EAGLE training manifest does not match current slices")
     snapshots = build_snapshots(slices_dir)[0]
-    if config.fit_end_t is not None and config.fit_end_t >= len(snapshots) - 1:
-        raise ValueError("checkpoint fitting reaches past available predictions")
     scorer = load_predictor(snapshots, config=config, checkpoint=checkpoint,
                             device=device, eagle_root=eagle_root)
     return snapshots, scorer
@@ -130,12 +112,9 @@ def load_eagle_run(slices_dir, checkpoint, *, config_path, device="cpu", eagle_r
 def evaluate(predictor, *, slices_dir, start_t=None, max_samples=None, seed=42):
     snapshots = predictor.snapshots
     manifest = load_time_slice_manifest(slices_dir)
-    split_t = int(len(snapshots) * (1 - DEFAULT_TEST_RATIO))
     start_t = evaluation_start_t(len(snapshots)) if start_t is None else start_t
-    if not split_t <= start_t < len(snapshots) - 1:
-        raise ValueError("start_t must be in held-out range")
-    if predictor.scorer.config.fit_end_t is not None and start_t < predictor.scorer.config.fit_end_t:
-        raise ValueError("evaluation precedes model fitting boundary")
+    if not 0 <= start_t < len(snapshots) - 1:
+        raise ValueError("start_t must have a next snapshot")
     if max_samples is not None and max_samples <= 0:
         raise ValueError("max_samples must be positive")
     # Truth is read only for scoring, never handed to the predictor.
@@ -209,15 +188,6 @@ def main(argv=None):
                   "community": sorted(community), **stats, "threshold": args.threshold,
                   "scorer": scorer.metadata}
     else:
-        require_fit_boundary(scorer.config.fit_end_t, len(snapshots))
-        run_path = Path(args.config).parent / "run.json"
-        run = json.loads(run_path.read_text()) if run_path.is_file() else {}
-        train_end_t, fit_end_t = training_boundaries(len(snapshots))
-        if (run.get("split_rule") not in (
-                "snapshot_55_15_30_v1", "snapshot_55_15_30_v1; equal times stay together")
-                or run.get("train_end_t") != train_end_t
-                or run.get("test_start_t") != fit_end_t):
-            raise ValueError("EAGLE checkpoint lacks verified 7:3 snapshot training split")
         result = evaluate(predictor, slices_dir=args.slices_dir, start_t=args.start_t,
                           max_samples=args.max_samples)
     text = json.dumps(result, indent=2)

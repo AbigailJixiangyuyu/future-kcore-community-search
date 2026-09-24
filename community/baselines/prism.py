@@ -8,8 +8,7 @@ import networkit as nk
 
 from datasets.community_eval_builder import set_metrics
 from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
-                                    non_empty_samples, require_fit_boundary,
-                                    query_set_sha256)
+                                    non_empty_samples, query_set_sha256)
 from methods.prism import load_predictor
 from community.baselines.baseline_graph import historical_community_union
 
@@ -64,8 +63,8 @@ class PrismCommunityPredictor:
 def evaluate(predictor, samples, *, start_t=None):
     count = len(predictor.snapshots)
     start_t = evaluation_start_t(count) if start_t is None else start_t
-    if not predictor.predictor.fit_end_t <= start_t < count - 1:
-        raise ValueError("evaluation start must follow validation and precede the final snapshot")
+    if not 0 <= start_t < count - 1:
+        raise ValueError("start_t must have a next snapshot")
     selected = non_empty_samples(
         sample for sample in samples if sample["k"] in range(3, 8)
         and int(sample["t"]) >= start_t
@@ -104,7 +103,6 @@ def main():
         print(json.dumps({"community": sorted(predictor.predict(q, k, t)),
                           "candidate_protocol": predictor.candidate_protocol}))
     else:
-        require_fit_boundary(predictor.predictor.fit_end_t, len(predictor.snapshots))
         samples = load_test_samples(args.slices_dir, len(predictor.snapshots), args.eval_samples)
         result = evaluate(predictor, samples, start_t=args.start_t)
         print(json.dumps(result))

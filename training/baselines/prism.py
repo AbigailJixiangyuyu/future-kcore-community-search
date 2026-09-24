@@ -11,12 +11,11 @@ import torch
 import torch.nn.functional as F
 
 from methods.prism import load_runtime, load_snapshots
-from datasets.baseline_split import training_boundaries
+from datasets.baseline_split import CURRENT_SPLIT, LEGACY_SPLIT, training_boundaries
 
 
 def split_boundaries(n, train_end=None, val_end=None):
-    # Community eval samples use current t >= floor(.7*N). Leave that range
-    # entirely outside both training and validation targets by default.
+    # Defaults retain the historical split; new runs pass explicit boundaries.
     default_train, default_val = training_boundaries(n)
     train_end = default_train if train_end is None else train_end
     val_end = default_val if val_end is None else val_end
@@ -47,8 +46,12 @@ def sample_negatives(nodes, positives, n, rng):
 
 
 def fit(snapshots, capacity, output, config, *, train_end, val_end,
-        epochs=10, batch_size=128, device="cpu", seed=2026, max_edges=None):
+        epochs=10, batch_size=128, device="cpu", seed=2026, max_edges=None,
+        split_rule=None):
     runtime = load_runtime()
+    if split_rule is not None and (train_end, val_end) != training_boundaries(
+            len(snapshots), split_rule):
+        raise ValueError("PRISM split boundaries do not match split rule")
     torch.manual_seed(seed)
     np.random.seed(seed)
     model = runtime.PrismSnapshotModel(capacity, config).to(device)
@@ -108,12 +111,14 @@ def fit(snapshots, capacity, output, config, *, train_end, val_end,
         print(json.dumps(report), flush=True)
         if val < best:
             best = val
-            torch.save({"protocol": runtime.PROTOCOL, "config": asdict(config),
+            checkpoint = {"protocol": runtime.PROTOCOL, "config": asdict(config),
                         "capacity": capacity, "train_end_t": train_end,
                         "val_end_t": val_end, "fit_end_t": val_end,
                         "prefix_digest": history.digest.hexdigest(),
-                        "model": {k: v.detach().cpu() for k, v in model.state_dict().items()}},
-                       str(output / "best.pt"))
+                        "model": {k: v.detach().cpu() for k, v in model.state_dict().items()}}
+            if split_rule is not None:
+                checkpoint["split_rule"] = split_rule
+            torch.save(checkpoint, str(output / "best.pt"))
     (output / "run.json").write_text(json.dumps({"train_end_t": train_end,
                         "val_end_t": val_end, "best_val_loss": best,
                         "max_edges_per_snapshot": max_edges}, indent=2) + "\n")
@@ -129,6 +134,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--train-end", type=int)
     parser.add_argument("--val-end", type=int)
+    parser.add_argument("--split-rule", choices=(LEGACY_SPLIT, CURRENT_SPLIT),
+                        default=CURRENT_SPLIT)
     parser.add_argument("--max-edges-per-snapshot", type=int,
                         help="smoke-only scoring cap; history still observes complete snapshots")
     parser.add_argument("--mem-dim", type=int, default=100)
@@ -142,14 +149,18 @@ def main():
         parser.error("epochs, batch-size and scoring cap must be positive")
     runtime = load_runtime()
     snapshots, capacity, _ = load_snapshots(args.slices_dir)
-    train_end, val_end = split_boundaries(len(snapshots), args.train_end, args.val_end)
+    defaults = training_boundaries(len(snapshots), args.split_rule)
+    train_end = defaults[0] if args.train_end is None else args.train_end
+    val_end = defaults[1] if args.val_end is None else args.val_end
+    train_end, val_end = split_boundaries(len(snapshots), train_end, val_end)
     config = runtime.Config(args.mem_dim, args.time_dim, args.emb_dim,
                             args.m_pass, args.neighbors)
     output = args.output_dir or str(Path(args.slices_dir) / "prism_runs" /
                                     datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     print(fit(snapshots, capacity, output, config, train_end=train_end,
               val_end=val_end, epochs=args.epochs, batch_size=args.batch_size,
-              device=args.device, max_edges=args.max_edges_per_snapshot))
+              device=args.device, max_edges=args.max_edges_per_snapshot,
+              split_rule=args.split_rule))
 
 
 if __name__ == "__main__":

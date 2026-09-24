@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from datasets.dataset_builder import load_slice_edges, load_time_slice_manifest
-from datasets.baseline_split import training_boundaries
+from datasets.baseline_split import CURRENT_SPLIT, LEGACY_SPLIT, training_boundaries
 
 
 DATASETS = {
@@ -28,10 +28,14 @@ DATASETS = {
     "reddit": ("reddit", 86400, 259200),
     "sx-askubuntu": ("sx-askubuntu", 604800, 2419200),
     "sx-superuser": ("sx-superuser", 604800, 2419200),
+    "wiki-talk-temporal": ("wiki-talk-temporal", 259200, 604800),
+    "sx-stackoverflow": ("sx-stackoverflow", 604800, 2419200),
+    "tgbl-coin": ("tgbl-coin", 86400, 86400),
 }
 
 
-def prepare_run(name, eagle_root, output_root, epochs=100, gpu=0):
+def prepare_run(name, eagle_root, output_root, epochs=100, gpu=0,
+                split_rule=LEGACY_SPLIT):
     dataset, step, window = DATASETS[name]
     slices_dir = ROOT / "data" / dataset / "time_slices" / (
         "step_{}_window_{}".format(step, window)
@@ -59,7 +63,7 @@ def prepare_run(name, eagle_root, output_root, epochs=100, gpu=0):
             sources.extend(u for u, _ in edges)
             destinations.extend(v for _, v in edges)
     timestamps = np.repeat(np.arange(1, len(counts) + 1), counts)
-    train_end_t, fit_end_t = training_boundaries(len(counts))
+    train_end_t, fit_end_t = training_boundaries(len(counts), split_rule)
     val_time, test_time = train_end_t + 1, fit_end_t + 1
     masks = (timestamps <= val_time,
              (timestamps > val_time) & (timestamps <= test_time),
@@ -98,7 +102,7 @@ def prepare_run(name, eagle_root, output_root, epochs=100, gpu=0):
         destination_nodes=len(set(destinations)),
         train_events=int(masks[0].sum()), val_events=int(masks[1].sum()),
         held_out_test_events=int(masks[2].sum()),
-        split_rule="snapshot_55_15_30_v1; equal times stay together",
+        split_rule=split_rule + "; equal times stay together",
         train_end_t=train_end_t, test_start_t=fit_end_t,
         val_time=float(val_time), test_time=float(test_time), fit_end_t=fit_end_t,
         first_test_target_t=int(timestamps[masks[2]].min()) - 1,
@@ -139,13 +143,16 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--split-rule", choices=(LEGACY_SPLIT, CURRENT_SPLIT),
+                        default=CURRENT_SPLIT)
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error("--epochs must be positive")
     eagle_root = args.eagle_root.resolve()
     output_root = (args.output_root or eagle_root / "log/snapshot-training").resolve()
     for name in args.datasets:
-        run, metadata = prepare_run(name, eagle_root, output_root, args.epochs, args.gpu)
+        run, metadata = prepare_run(name, eagle_root, output_root, args.epochs, args.gpu,
+                                    args.split_rule)
         if not args.prepare_only:
             launch(run, metadata)
         print(json.dumps(metadata, indent=2), flush=True)

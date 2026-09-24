@@ -173,6 +173,8 @@ class PrismSnapshotPredictor:
             raise ValueError("unsupported PRISM checkpoint protocol")
         self.snapshots = snapshots
         self.fit_end_t = int(payload["fit_end_t"])
+        self.training_split = {key: payload.get(key) for key in (
+            "split_rule", "train_end_t", "val_end_t", "fit_end_t")}
         self.config = Config(**payload["config"])
         self.history = SnapshotHistory(payload["capacity"])
         self.model = PrismSnapshotModel(payload["capacity"], self.config).to(device)

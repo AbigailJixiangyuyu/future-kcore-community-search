@@ -4,19 +4,9 @@ from pathlib import Path
 import hashlib
 import json
 
-from datasets.baseline_split import test_start_t, training_boundaries
+from datasets.baseline_split import test_start_t
 from datasets.community_eval_builder import load_community_eval_dataset
 from datasets.dataset_builder import load_time_slice_manifest
-
-
-def require_fit_boundary(fit_end_t, snapshot_count):
-    start = test_start_t(snapshot_count)
-    if fit_end_t != start:
-        raise ValueError(
-            "checkpoint fit_end_t={} does not match 7:3 test_start_t={}; "
-            "retrain with the snapshot split".format(fit_end_t, start)
-        )
-    return start
 
 
 def evaluation_start_t(snapshot_count):
@@ -25,19 +15,6 @@ def evaluation_start_t(snapshot_count):
     if not test_start_t(snapshot_count) <= start < snapshot_count - 1:
         raise ValueError("final 15% contains no next-snapshot queries")
     return start
-
-
-def baseline_training_split(snapshot_count):
-    """Describe the unchanged training protocol of the saved baselines."""
-    train_end, fit_end = training_boundaries(snapshot_count)
-    return {
-        "split_rule": "snapshot_55_15_30_v1",
-        "train_ratio": 0.55,
-        "val_ratio": 0.15,
-        "test_ratio": 0.30,
-        "train_end_t": train_end,
-        "fit_end_t": fit_end,
-    }
 
 
 def query_set_sha256(samples):

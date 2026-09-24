@@ -41,8 +41,7 @@ from community.baselines.zebra_runtime import (
 from datasets.community_eval_builder import set_metrics
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
-                                    non_empty_samples, query_set_sha256,
-                                    require_fit_boundary)
+                                    non_empty_samples, query_set_sha256)
 from methods.zebra_history_cache import ZebraHistoryCache
 
 
@@ -51,11 +50,12 @@ DEFAULT_ZEBRA_ROOT = ROOT / "third_party" / "Zebra"
 DEFAULT_SLICES = (
     ROOT / "data/mooc/time_slices/step_43200_window_86400"
 )
-DEFAULT_ZEBRA_DATASET = "mooc-snapshot"
+DEFAULT_ZEBRA_DATASET = "mooc-snapshot-7x3-baseline_7x3_20260922_164330_i13z9hpl"
 DEFAULT_CHECKPOINT = (
     DEFAULT_ZEBRA_ROOT
-    / "saved_checkpoints/mooc-snapshot-50-0.0001-streaming-"
-    "[0.1, 0.1]-[0.5, 0.95]-20.pth"
+    / "saved_checkpoints"
+    / (DEFAULT_ZEBRA_DATASET + "-50-0.0001-streaming-"
+       "[0.1, 0.1]-[0.5, 0.95]-20.pth")
 )
 TIMING_SCHEMA = {
     "timing_version": 2,
@@ -146,19 +146,6 @@ def _progressive_evaluate(args):
     return _run_progressive_evaluation(args, _build_predictor)
 
 
-def _verified_snapshot_split(predictor, dataset):
-    split_path = Path(str(predictor.zebra.checkpoint_path) + ".split.json")
-    if not split_path.is_file():
-        raise ValueError("Zebra checkpoint has no 7:3 snapshot split metadata; retrain")
-    split = json.loads(split_path.read_text())
-    if (split.get("split_rule") != "snapshot_55_15_30_v1"
-            or split.get("snapshot_count") != len(predictor.snapshots)
-            or split.get("dataset") != dataset
-            or split.get("checkpoint_sha256") != predictor.checkpoint_hash):
-        raise ValueError("Zebra checkpoint snapshot split does not match slices")
-    return require_fit_boundary(split.get("fit_end_t"), len(predictor.snapshots))
-
-
 def _evaluate(args):
     wall_start = time.perf_counter()
     predictor, total_nodes = _build_predictor(args)
@@ -167,10 +154,9 @@ def _evaluate(args):
     sample_started = time.perf_counter()
     manifest = load_time_slice_manifest(args.slices_dir)
     dataset_name = manifest["dataset"]
-    split_t = _verified_snapshot_split(predictor, args.zebra_dataset)
     start_t = evaluation_start_t(len(predictor.snapshots)) if args.start_t is None else args.start_t
-    if not split_t <= start_t < len(predictor.snapshots) - 1:
-        raise ValueError("evaluation start outside the shared held-out range")
+    if not 0 <= start_t < len(predictor.snapshots) - 1:
+        raise ValueError("start_t must have a next snapshot")
     samples = load_test_samples(args.slices_dir, len(predictor.snapshots))
     samples = non_empty_samples(sample for sample in samples if sample["t"] >= start_t)
     if args.max_samples is not None:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run selected 7:3 baseline trainings sequentially on one GPU."""
+"""Run selected snapshot baseline trainings sequentially on one GPU."""
 
 import argparse
 from datetime import datetime, timezone
@@ -24,10 +24,15 @@ DATASETS = {
     "sx-superuser": ("sx-superuser", "step_604800_window_2419200"),
     "mooc": ("mooc", "step_43200_window_86400"),
     "email": ("email-Eu-core-temporal", "step_302400_window_604800"),
+    "wiki-talk-temporal": ("wiki-talk-temporal", "step_259200_window_604800"),
+    "sx-stackoverflow": ("sx-stackoverflow", "step_604800_window_2419200"),
+    "tgbl-coin": ("tgbl-coin", "step_86400_window_86400"),
 }
 DEFAULT_DATASETS = ("lastfm", "reddit", "sx-askubuntu", "sx-superuser")
 METHODS = ("eagle", "zebra", "swift", "tfwaveformer", "prism")
 MIN_FREE_BYTES = 4 * 1024 ** 3
+
+from datasets.baseline_split import CURRENT_SPLIT, LEGACY_SPLIT, training_boundaries
 
 
 def _write_json(path, payload):
@@ -53,6 +58,8 @@ def _run(command, cwd, *, env=None):
 
 def _train(job, job_path):
     method, dataset = job["method"], job["dataset"]
+    split_rule = job.get("split_rule", LEGACY_SPLIT)
+    train_end, fit_end = training_boundaries(job["snapshot_count"], split_rule)
     slices = Path(job["slices_dir"])
     batch = Path(job["batch_dir"])
     output = batch / "artifacts" / method / dataset
@@ -65,14 +72,15 @@ def _train(job, job_path):
         from scripts.launch_eagle_time_training import prepare_run
 
         run, metadata = prepare_run(dataset, BASELINES / "EAGLE", output.parent,
-                                    epochs=50, gpu=0)
+                                    epochs=50, gpu=0, split_rule=split_rule)
         _update(job_path, artifact=str(run), checkpoint=metadata["checkpoint"])
         _run(metadata["command"][1:], run, env=env)
         if not Path(metadata["checkpoint"]).is_file():
             raise FileNotFoundError("EAGLE did not produce its trained checkpoint")
     elif method == "zebra":
         zebra_root = BASELINES / "Zebra"
-        zebra_data = "{}-snapshot-7x3-{}".format(dataset, batch.name)
+        zebra_data = "{}-snapshot-{}-{}".format(
+            dataset, "70_15_15" if split_rule == CURRENT_SPLIT else "7x3", batch.name)
         _run([sys.executable, "-u", zebra_root / "utils/preprocess_time_slices.py",
               "--input", slices, "--data", zebra_data], ROOT, env=env)
         _update(job_path, zebra_dataset=zebra_data,
@@ -86,17 +94,20 @@ def _train(job, job_path):
               "--message_function", "identity", "--memory_updater", "gru",
               "--aggregator", "last", "--tppr_strategy", "streaming",
               "--topk", "20", "--alpha_list", "0.1", "0.1",
-              "--beta_list", "0.5", "0.95", "--gpu", "0", "--save_best"],
+              "--beta_list", "0.5", "0.95", "--gpu", "0", "--save_best",
+              "--snapshot-split-rule", split_rule],
              zebra_root, env=env)
         sidecars = list((zebra_root / "saved_checkpoints").glob(
             zebra_data + "*.pth.split.json"))
         if len(sidecars) != 1 or not Path(str(sidecars[0])[:-len(".split.json")]).is_file():
-            raise FileNotFoundError("Zebra checkpoint and 7:3 sidecar were not produced")
+            raise FileNotFoundError("Zebra checkpoint and snapshot split sidecar were not produced")
         _update(job_path, checkpoint=str(sidecars[0])[:-len(".split.json")])
     elif method == "swift":
         _run(["bash", BASELINES / "SWIFT/run_local.sh",
               BASELINES / "SWIFT/snapshot_adapter.py", slices,
-              "--output", output, "--model", "TGAT", "--epochs", "5"],
+              "--output", output, "--model", "TGAT", "--epochs", "5",
+              "--train-end", train_end + 1, "--val-end", fit_end + 1,
+              "--split-rule", split_rule],
              ROOT, env=env)
         if not (output / "best.pt").is_file():
             raise FileNotFoundError("SWIFT did not produce its trained checkpoint")
@@ -104,13 +115,16 @@ def _train(job, job_path):
     elif method == "tfwaveformer":
         _run([sys.executable, "-u", "-m", "training.baselines.tfwaveformer", slices,
               "--output-dir", output, "--device", "cuda:0", "--epochs", "30",
-              "--patience", "5", "--threads", "2"], ROOT, env=env)
+              "--patience", "5", "--threads", "2", "--train-end-t", train_end,
+              "--val-end-t", fit_end, "--split-rule", split_rule], ROOT, env=env)
         if not (output / "best.pt").is_file():
             raise FileNotFoundError("TFWaveFormer did not produce its trained checkpoint")
         _update(job_path, artifact=str(output), checkpoint=str(output / "best.pt"))
     elif method == "prism":
         _run([sys.executable, "-u", "-m", "training.baselines.prism", slices,
-              "--output-dir", output, "--device", "cuda:0", "--epochs", "10"],
+              "--output-dir", output, "--device", "cuda:0", "--epochs", "10",
+              "--train-end", train_end, "--val-end", fit_end,
+              "--split-rule", split_rule],
              ROOT, env=env)
         if not (output / "best.pt").is_file():
             raise FileNotFoundError("PRISM did not produce its trained checkpoint")
@@ -174,7 +188,8 @@ def _select(requested, available, label):
     return selected
 
 
-def launch(dataset_names=None, method_names=None):
+def launch(dataset_names=None, method_names=None, *, start=True,
+           split_rule=CURRENT_SPLIT):
     from datasets.baseline_eval import load_test_samples
     from datasets.baseline_split import test_start_t
     from datasets.dataset_builder import load_time_slice_manifest
@@ -191,11 +206,13 @@ def launch(dataset_names=None, method_names=None):
         slices = ROOT / "data" / source_name / "time_slices" / configuration
         manifest = load_time_slice_manifest(slices)
         count = len(manifest["slices"])
+        training_boundaries(count, split_rule)
         load_test_samples(slices, count)
         counts[name] = (slices, count, test_start_t(count))
     results = ROOT / "results"
     results.mkdir(parents=True, exist_ok=True)
-    batch = Path(tempfile.mkdtemp(prefix="baseline_7x3_" +
+    label = "baseline_70_15_15_" if split_rule == CURRENT_SPLIT else "baseline_7x3_"
+    batch = Path(tempfile.mkdtemp(prefix=label +
                    datetime.now().strftime("%Y%m%d_%H%M%S") + "_", dir=results))
     (batch / "jobs").mkdir()
     (batch / "logs").mkdir()
@@ -208,19 +225,21 @@ def launch(dataset_names=None, method_names=None):
             _write_json(path, dict(method=method, dataset=dataset,
                         snapshot_count=count, test_start_t=start,
                         slices_dir=str(slices), batch_dir=str(batch),
-                        log=str(log), status="scheduled"))
+                        log=str(log), split_rule=split_rule, status="scheduled"))
             jobs.append(path)
     manifest_path = batch / "manifest.json"
-    _write_json(manifest_path, dict(protocol="snapshot_55_15_30_v1",
+    _write_json(manifest_path, dict(protocol=split_rule,
                 datasets=list(dataset_names), methods=list(method_names),
                 jobs=[str(job) for job in jobs], status="scheduled",
                 created_at=datetime.now(timezone.utc).isoformat()))
-    with (batch / "supervisor.log").open("ab", buffering=0) as log:
-        process = subprocess.Popen(["nohup", sys.executable, "-u", __file__,
-                                    "run-batch", str(batch)], cwd=ROOT,
-                                   stdin=subprocess.DEVNULL, stdout=log,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
-    print("{} pid={}".format(batch, process.pid), flush=True)
+    if start:
+        with (batch / "supervisor.log").open("ab", buffering=0) as log:
+            process = subprocess.Popen(["nohup", sys.executable, "-u", __file__,
+                                        "run-batch", str(batch)], cwd=ROOT,
+                                       stdin=subprocess.DEVNULL, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        print("{} pid={}".format(batch, process.pid), flush=True)
+    return batch
 
 
 def status(batch):

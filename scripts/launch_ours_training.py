@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the four missing Ours trainings sequentially on cuda:0."""
+"""Launch selected Ours trainings sequentially on cuda:0."""
 
 import argparse
 from datetime import datetime, timezone
@@ -24,7 +24,11 @@ DATASETS = {
     "lastfm": "data/lastfm/time_slices/step_604800_window_2419200",
     "sx-askubuntu": "data/sx-askubuntu/time_slices/step_604800_window_2419200",
     "sx-superuser": "data/sx-superuser/time_slices/step_604800_window_2419200",
+    "wiki-talk-temporal": "data/wiki-talk-temporal/time_slices/step_259200_window_604800",
+    "sx-stackoverflow": "data/sx-stackoverflow/time_slices/step_604800_window_2419200",
+    "tgbl-coin": "data/tgbl-coin/time_slices/step_86400_window_86400",
 }
+DEFAULT_DATASETS = ("reddit", "lastfm", "sx-askubuntu", "sx-superuser")
 MIN_FREE_BYTES = 4 * 1024 ** 3
 
 
@@ -71,7 +75,7 @@ def _validate(name, slices_dir, output, snapshot_count):
     }
 
 
-def launch(datasets=None):
+def launch(datasets=None, *, start=True):
     from datasets.coreness_prediction_builder import prediction_split_config
     from datasets.dataset_builder import load_time_slice_manifest
     import torch
@@ -104,13 +108,15 @@ def launch(datasets=None):
         "status": "scheduled", "created_at": _now(),
         "device": "cuda:0", "order": list(jobs), "jobs": jobs,
     })
-    with (run_dir / "driver.log").open("ab", buffering=0) as log:
-        process = subprocess.Popen(
-            ["nohup", sys.executable, "-u", __file__, "run", str(run_dir)],
-            cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log,
-            stderr=subprocess.STDOUT, start_new_session=True,
-        )
-    print("{} pid={}".format(run_dir, process.pid), flush=True)
+    if start:
+        with (run_dir / "driver.log").open("ab", buffering=0) as log:
+            process = subprocess.Popen(
+                ["nohup", sys.executable, "-u", __file__, "run", str(run_dir)],
+                cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        print("{} pid={}".format(run_dir, process.pid), flush=True)
+    return run_dir
 
 
 def run(run_dir):
@@ -187,7 +193,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
     launch_parser = subparsers.add_parser("launch")
     launch_parser.add_argument("--datasets", nargs="+", choices=sorted(DATASETS),
-                               default=list(DATASETS))
+                               default=list(DEFAULT_DATASETS))
     for action in ("run", "status"):
         subparsers.add_parser(action).add_argument("run_dir", type=Path)
     args = parser.parse_args()

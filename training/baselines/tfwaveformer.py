@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from methods.tfwaveformer import DEFAULT_ROOT, load_runtime, load_snapshot_edges
 from datasets.baseline_split import training_boundaries
+from datasets.baseline_split import CURRENT_SPLIT, LEGACY_SPLIT
 
 
 def sample_negatives(nodes, positive_edges, count, rng):
@@ -125,7 +126,8 @@ def run_epoch(runtime, model, snapshots, config, train_end, val_end, *,
 
 def train(snapshots, runtime, config, output_dir, *, train_end_t=None, val_end_t=None,
           epochs=100, patience=5, batch_size=128, learning_rate=1e-4,
-          weight_decay=0., seed=2024, device="cpu", max_edges=None, source=None):
+          weight_decay=0., seed=2024, device="cpu", max_edges=None, source=None,
+          split_rule=None):
     for name, value in (("epochs", epochs), ("patience", patience), ("batch_size", batch_size)):
         runtime.integer(value, name, 1)
     if max_edges is not None:
@@ -135,7 +137,14 @@ def train(snapshots, runtime, config, output_dir, *, train_end_t=None, val_end_t
         raise ValueError("learning_rate must be positive and finite")
     if not np.isfinite(weight_decay) or weight_decay < 0:
         raise ValueError("weight_decay must be nonnegative and finite")
+    if split_rule == CURRENT_SPLIT:
+        defaults = training_boundaries(len(snapshots), split_rule)
+        train_end_t = defaults[0] if train_end_t is None else train_end_t
+        val_end_t = defaults[1] if val_end_t is None else val_end_t
     train_end, val_end = split_boundaries(len(snapshots), train_end_t, val_end_t)
+    if split_rule is not None and (train_end, val_end) != training_boundaries(
+            len(snapshots), split_rule):
+        raise ValueError("TFWaveFormer split boundaries do not match split rule")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     metadata = dict(
@@ -143,7 +152,7 @@ def train(snapshots, runtime, config, output_dir, *, train_end_t=None, val_end_t
         train_end_t=train_end, val_end_t=val_end, fit_end_t=val_end,
         first_test_target_t=val_end + 1, snapshot_count=len(snapshots),
         train_target_range=[1, train_end], val_target_range=[train_end + 1, val_end],
-        split_rule="chronological snapshot boundaries; snapshot 0 is history only",
+        split_rule=split_rule or "chronological snapshot boundaries; snapshot 0 is history only",
         attributes="zero_float32", undirected="mean_logits",
         negative_sampling="uniform observed-node nonedges with replacement, 1:1",
         epochs=epochs, patience=patience, batch_size=batch_size,
@@ -210,6 +219,8 @@ def main():
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--train-end-t", type=int)
     parser.add_argument("--val-end-t", type=int)
+    parser.add_argument("--split-rule", choices=(LEGACY_SPLIT, CURRENT_SPLIT),
+                        default=CURRENT_SPLIT)
     parser.add_argument("--max-edges-per-snapshot", type=int, help="optional subsampling for smoke runs; default uses all edges")
     parser.add_argument("--feature-dim", type=int, default=172)
     parser.add_argument("--time-feat-dim", type=int, default=100)
@@ -236,6 +247,7 @@ def main():
         epochs=args.epochs, patience=args.patience, batch_size=args.batch_size,
         learning_rate=args.learning_rate, weight_decay=args.weight_decay, seed=args.seed,
         device=args.device, max_edges=args.max_edges_per_snapshot, source=str(slices),
+        split_rule=args.split_rule,
     )
     print(json.dumps(metadata, indent=2), flush=True)
 

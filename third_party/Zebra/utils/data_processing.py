@@ -83,7 +83,8 @@ def load_feat(d):
 
 
 ############## load a batch of training data ##############
-def get_data(dataset_name, snapshot_count=None):
+def get_data(dataset_name, snapshot_count=None,
+             snapshot_split_rule='snapshot_55_15_30_v1'):
   graph_df = pd.read_csv(DATA_ROOT / dataset_name / 'ml_{}.csv'.format(dataset_name))
 
   #edge_features = np.load('../data/{}/ml_{}.npy'.format(dataset_name,dataset_name))
@@ -95,8 +96,14 @@ def get_data(dataset_name, snapshot_count=None):
   else:
     if snapshot_count < 4 or graph_df.ts.min() != 1 or graph_df.ts.max() != snapshot_count:
       raise ValueError("snapshot count does not match consecutive 1-based timestamps")
-    val_time = int(snapshot_count * 0.55)
-    test_time = int(snapshot_count * 0.7) + 1
+    if snapshot_split_rule == 'snapshot_55_15_30_v1':
+      val_time = int(snapshot_count * 0.55)
+      test_time = int(snapshot_count * 0.7) + 1
+    elif snapshot_split_rule == 'snapshot_70_15_15_v1':
+      val_time = int(snapshot_count * 0.7)
+      test_time = int(snapshot_count * 0.85) + 1
+    else:
+      raise ValueError('unknown snapshot split rule: {}'.format(snapshot_split_rule))
     if not 2 <= val_time < test_time < snapshot_count:
       raise ValueError("not enough snapshots for train/val/test")
   sources = graph_df.u.values

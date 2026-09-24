@@ -187,6 +187,7 @@ class SnapshotPredictor:
         if saved.get("protocol") != self.protocol:
             raise ValueError("incompatible SWIFT snapshot checkpoint")
         self.fit_end_t = int(saved["fit_end_t"])
+        self.training_split = saved.get("training_split")
         self.expected_digest = saved["digest"]
         self.engine = SnapshotEngine(**saved["config"], state=saved["model"])
 
@@ -240,11 +241,21 @@ def split_bounds(count, train_end=None, val_end=None):
 
 def train(snapshots, output, kind="TGAT", layers=1, fanout=3,
           epochs=1, batch_size=128, train_end=None, val_end=None,
-          max_edges_per_snapshot=None, seed=2026):
+          max_edges_per_snapshot=None, seed=2026, split_rule=None):
     """Train targets [1, train_end); validate [train_end, val_end)."""
     if epochs < 1 or (max_edges_per_snapshot is not None and max_edges_per_snapshot < 1):
         raise ValueError("epochs and optional smoke edge limit must be positive")
+    if split_rule == "snapshot_70_15_15_v1":
+        train_end = int(len(snapshots) * .7) if train_end is None else train_end
+        val_end = int(len(snapshots) * .85) + 1 if val_end is None else val_end
     train_end, val_end = split_bounds(len(snapshots), train_end, val_end)
+    if split_rule is not None:
+        ratio = .7 if split_rule == "snapshot_70_15_15_v1" else .55
+        held_out = .85 if split_rule == "snapshot_70_15_15_v1" else .7
+        if split_rule not in ("snapshot_70_15_15_v1", "snapshot_55_15_30_v1") or (
+                train_end, val_end) != (int(len(snapshots) * ratio),
+                                       int(len(snapshots) * held_out) + 1):
+            raise ValueError("SWIFT split boundaries do not match split rule")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(seed)
@@ -299,12 +310,17 @@ def train(snapshots, output, kind="TGAT", layers=1, fanout=3,
             best = ap
             # Replaying the prefix with the selected model gives a reproducible
             # inference state; no ephemeral training mailbox is serialized.
-            torch.save({"protocol": SnapshotPredictor.protocol,
+            checkpoint = {"protocol": SnapshotPredictor.protocol,
                         "model": {k: v.detach().cpu() for k, v in engine.model.state_dict().items()},
                         "config": dict(kind=kind, layers=layers, fanout=fanout,
                                        batch_size=batch_size),
                         "fit_end_t": val_end - 1,
-                        "digest": engine.history.digest.hexdigest()}, output / "best.pt")
+                        "digest": engine.history.digest.hexdigest()}
+            if split_rule is not None:
+                checkpoint["training_split"] = dict(
+                    split_rule=split_rule, snapshot_count=len(snapshots),
+                    train_end_t=train_end - 1, fit_end_t=val_end - 1)
+            torch.save(checkpoint, output / "best.pt")
     (output / "report.json").write_text(json.dumps({"train_end": train_end,
         "val_end": val_end, "smoke_edge_limit": max_edges_per_snapshot,
         "epochs": reports}, indent=2) + "\n")
@@ -322,6 +338,8 @@ def main():
     parser.add_argument("--fanout", type=int, default=3)
     parser.add_argument("--train-end", type=int)
     parser.add_argument("--val-end", type=int)
+    parser.add_argument("--split-rule", choices=("snapshot_55_15_30_v1",
+                        "snapshot_70_15_15_v1"), default="snapshot_70_15_15_v1")
     parser.add_argument("--max-edges-per-snapshot", type=int, help="smoke test only")
     args = parser.parse_args()
     from pathlib import Path as _Path
@@ -330,7 +348,7 @@ def main():
     from methods.swift_snapshot import load_snapshot_edges
     train(load_snapshot_edges(args.slices_dir), args.output, args.model, args.layers,
           args.fanout, args.epochs, args.batch_size, args.train_end, args.val_end,
-          args.max_edges_per_snapshot)
+          args.max_edges_per_snapshot, split_rule=args.split_rule)
 
 
 if __name__ == "__main__":

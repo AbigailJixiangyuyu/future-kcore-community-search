@@ -81,13 +81,18 @@ python -m community.generated_edges 413 7 52 \
   --checkpoint data/mooc/time_slices/step_43200_window_86400/model_cache/hybrid_coreness.pt \
   --device cuda:0
 
-# Zebra (requires a locally trained Zebra checkpoint and prepared Zebra data)
+# Zebra (defaults to the locally migrated MOOC checkpoint and prepared data)
 python -m community.baselines.zebra query 413 7 52 --device cuda:0
 ```
 
 Ours caches compatible historical streaming state automatically at the first
 requested time. For other datasets, supply `--slices-dir` and a matching
-checkpoint; Zebra also accepts `--zebra-dataset` and `--checkpoint`.
+checkpoint; Zebra also accepts `--zebra-dataset` and `--checkpoint`. For email,
+pass its slice directory, Zebra dataset name and matching checkpoint explicitly.
+Local Zebra checkpoints and their preprocessed inputs live under
+`third_party/Zebra/saved_checkpoints/` and `third_party/Zebra/data/`; these
+generated artifacts are ignored by Git. Other trained baselines already keep
+their checkpoints under `results/`.
 
 ## Evaluate
 

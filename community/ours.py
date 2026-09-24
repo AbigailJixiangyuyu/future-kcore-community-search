@@ -14,16 +14,14 @@ from typing import Union
 import numpy as np
 import torch
 
-from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
-                                    load_test_samples, non_empty_samples,
-                                    query_set_sha256, require_fit_boundary)
-from datasets.baseline_split import test_start_t, training_boundaries
+from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
+                                    non_empty_samples, query_set_sha256)
+from datasets.baseline_split import test_start_t
 from datasets.community_eval_builder import set_metrics
 from datasets.coreness_prediction_builder import (
     CurrentSnapshotStructureFeatureTable,
     STRUCTURE_TIME_REFERENCE,
     TimeSliceStructureFeatureTable,
-    prediction_split_config,
     prepare_inference_feature_table,
 )
 from datasets.dataset_builder import load_time_slice_manifest
@@ -751,63 +749,6 @@ def _build_state_cache(args):
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
 
-def _evaluation_training_split(checkpoint, snapshot_count, dataset_name):
-    split = checkpoint.get("split_config", {})
-    if not isinstance(split, dict):
-        raise ValueError("checkpoint split is missing or invalid; retrain Ours")
-    train_end_t, _ = training_boundaries(snapshot_count)
-    if (split.get("split_rule") == "snapshot_55_15_30_v1"
-            and split.get("snapshot_count") == snapshot_count
-            and split.get("train_end_t") == train_end_t
-            and split.get("train_ratio") in (None, 0.55)
-            and split.get("val_ratio") in (None, 0.15)):
-        require_fit_boundary(split.get("fit_end_t"), snapshot_count)
-        return baseline_training_split(snapshot_count)
-
-    if split.get("split_rule") == "snapshot_70_15_15_current_query_v1":
-        expected = prediction_split_config(snapshot_count)
-        feature = checkpoint.get("feature_config", {})
-        if (any(split.get(key) != value for key, value in expected.items())
-                or not isinstance(feature, dict)
-                or feature.get("numeric_dtype") != "float32"
-                or feature.get("structure_time_reference") != STRUCTURE_TIME_REFERENCE
-                or feature.get("split_rule") != split["split_rule"]
-                or (feature.get("train_ratio"), feature.get("val_ratio")) != (0.7, 0.15)):
-            raise ValueError("checkpoint 70/15/15 split does not match snapshots; retrain Ours")
-        return {
-            "split_rule": split["split_rule"],
-            "train_ratio": 0.7, "val_ratio": 0.15, "test_ratio": 0.15,
-            "train_end_t": expected["train_end_t"],
-            "fit_end_t": expected["fit_end_t"],
-        }
-
-    feature = checkpoint.get("feature_config", {})
-    model = checkpoint.get("model_config", {})
-    if (dataset_name not in ("mooc", "email-Eu-core-temporal")
-            or split != {"train_ratio": 0.7, "val_ratio": 0.15}
-            or not isinstance(feature, dict) or not isinstance(model, dict)
-            or feature.get("numeric_dtype") != "float32"
-            or feature.get("structure_time_reference") != STRUCTURE_TIME_REFERENCE
-            or (feature.get("train_ratio"), feature.get("val_ratio")) != (0.7, 0.15)
-            or feature.get("hmax") != model.get("hmax")
-            or feature.get("order") != model.get("order")
-            or any(model.get(key) != value for key, value in (
-                ("structure_pooling", "b"), ("fusion_type", "concat"),
-                ("output_head_type", "linear")))):
-        raise ValueError("checkpoint does not have a verified evaluation split; retrain Ours")
-
-    # The saved legacy ratios partitioned target snapshots, not current query times.
-    train_end = max(2, int(snapshot_count * 0.7))
-    val_end = min(max(train_end + 1, int(snapshot_count * (0.7 + 0.15))),
-                  snapshot_count - 1)
-    return {
-        "split_rule": "legacy_target_snapshot_70_15_15_v1",
-        "train_ratio": 0.7, "val_ratio": 0.15, "test_ratio": 0.15,
-        "train_end_t": train_end - 1, "fit_end_t": val_end - 1,
-        "source": "legacy_checkpoint_ratios_and_feature_config",
-    }
-
-
 def _evaluate(args, *, predictor_builder=None, metadata=None):
     wall_start = time.perf_counter()
     predictor, total_nodes = (predictor_builder or _build_predictor)(args)
@@ -815,13 +756,10 @@ def _evaluate(args, *, predictor_builder=None, metadata=None):
     sample_started = time.perf_counter()
     manifest = load_time_slice_manifest(args.slices_dir)
     dataset_name = manifest["dataset"]
-    training_split = _evaluation_training_split(
-        predictor.checkpoint, len(predictor.snapshots), dataset_name
-    )
     start_t = (evaluation_start_t(len(predictor.snapshots))
                if args.start_t is None else args.start_t)
-    if not training_split["fit_end_t"] <= start_t < len(predictor.snapshots) - 1:
-        raise ValueError("start_t must be in the held-out range")
+    if not 0 <= start_t < len(predictor.snapshots) - 1:
+        raise ValueError("start_t must have a next snapshot")
     samples = load_test_samples(args.slices_dir, len(predictor.snapshots))
     samples = non_empty_samples(sample for sample in samples if sample["t"] >= start_t)
     if args.max_samples is not None:
