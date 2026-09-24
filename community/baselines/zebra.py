@@ -40,9 +40,9 @@ from community.baselines.zebra_runtime import (
 )
 from datasets.community_eval_builder import set_metrics
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
-from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
-                                    load_test_samples, non_empty_samples,
-                                    query_set_sha256, require_fit_boundary)
+from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
+                                    non_empty_samples, query_set_sha256,
+                                    require_fit_boundary)
 from methods.zebra_history_cache import ZebraHistoryCache
 
 
@@ -236,7 +236,6 @@ def _evaluate(args):
         **TIMING_SCHEMA,
         "dataset": dataset_name,
         "start_t": start_t,
-        "training_split": baseline_training_split(len(predictor.snapshots)),
         "threshold": predictor.threshold,
         **predictor.candidate_metadata,
         "samples": len(samples),

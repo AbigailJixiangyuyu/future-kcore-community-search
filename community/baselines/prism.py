@@ -7,9 +7,9 @@ import json
 import networkit as nk
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
-                                    load_test_samples, non_empty_samples,
-                                    require_fit_boundary, query_set_sha256)
+from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
+                                    non_empty_samples, require_fit_boundary,
+                                    query_set_sha256)
 from methods.prism import load_predictor
 from community.baselines.baseline_graph import historical_community_union
 
@@ -107,7 +107,6 @@ def main():
         require_fit_boundary(predictor.predictor.fit_end_t, len(predictor.snapshots))
         samples = load_test_samples(args.slices_dir, len(predictor.snapshots), args.eval_samples)
         result = evaluate(predictor, samples, start_t=args.start_t)
-        result["training_split"] = baseline_training_split(len(predictor.snapshots))
         print(json.dumps(result))
 
 

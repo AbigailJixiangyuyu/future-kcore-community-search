@@ -71,7 +71,7 @@ def _validate(name, slices_dir, output, snapshot_count):
     }
 
 
-def launch():
+def launch(datasets=None):
     from datasets.coreness_prediction_builder import prediction_split_config
     from datasets.dataset_builder import load_time_slice_manifest
     import torch
@@ -81,8 +81,11 @@ def launch():
     if shutil.disk_usage(ROOT).free < MIN_FREE_BYTES:
         raise RuntimeError("less than 4 GiB free; refusing to launch")
 
+    if datasets is None:
+        datasets = list(DATASETS)
     jobs = {}
-    for name, relative in DATASETS.items():
+    for name in datasets:
+        relative = DATASETS[name]
         slices = ROOT / relative
         count = len(load_time_slice_manifest(slices)["slices"])
         jobs[name] = {
@@ -182,12 +185,14 @@ def status(run_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("launch")
+    launch_parser = subparsers.add_parser("launch")
+    launch_parser.add_argument("--datasets", nargs="+", choices=sorted(DATASETS),
+                               default=list(DATASETS))
     for action in ("run", "status"):
         subparsers.add_parser(action).add_argument("run_dir", type=Path)
     args = parser.parse_args()
     if args.command == "launch":
-        launch()
+        launch(args.datasets)
     elif args.command == "status":
         status(args.run_dir)
     else:

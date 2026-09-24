@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
-                                    load_test_samples, non_empty_samples,
-                                    require_fit_boundary, query_set_sha256)
+from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
+                                    non_empty_samples, require_fit_boundary,
+                                    query_set_sha256)
 from datasets.dataset_builder import build_snapshots, load_time_slice_manifest
 from methods.tfwaveformer import DEFAULT_ROOT, SnapshotEdges, load_runtime
 from community.baselines.baseline_graph import component_after_peeling
@@ -206,7 +206,7 @@ def main(argv=None):
         result = predictor.predict(args.q, args.k, args.t)
     else:
         manifest = load_time_slice_manifest(args.slices_dir)
-        start_t, boundary_source = evaluation_boundary(
+        start_t, _ = evaluation_boundary(
             link, len(snapshots),
             evaluation_start_t(len(snapshots)) if args.start_t is None else args.start_t,
         )
@@ -215,17 +215,8 @@ def main(argv=None):
         result = evaluate(predictor, samples, start_t=start_t,
                           max_samples=args.max_samples)
         result["dataset"] = manifest["dataset"]
-        result["training_split"] = baseline_training_split(len(snapshots))
-        result["boundary_source"] = boundary_source
-        result["training_scope"] = (
-            "smoke_only" if link.training_metadata is not None
-            and link.training_metadata.get("max_edges_per_snapshot") is not None
-            else "checkpoint_split" if boundary_source == "checkpoint_held_out_split"
-            else "unknown"
-        )
     result.update(checkpoint=str(args.checkpoint.resolve()),
                   slices_dir=str(args.slices_dir.resolve()),
-                  fit_end_t=link.fit_end_t,
                   threshold_calibrated=False,
                   candidate_protocol="historical_q_k_community_union_and_historical_edges")
     rendered = json.dumps(result, indent=2)

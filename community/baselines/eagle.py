@@ -12,9 +12,9 @@ import numpy as np
 from scipy import sparse
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
-                                    load_test_samples, non_empty_samples,
-                                    query_set_sha256, require_fit_boundary)
+from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
+                                    non_empty_samples, query_set_sha256,
+                                    require_fit_boundary)
 from datasets.baseline_split import training_boundaries
 from datasets.dataset_builder import DEFAULT_TEST_RATIO, build_snapshots, load_time_slice_manifest
 from methods.eagle import DEFAULT_ROOT, load_predictor, load_runtime
@@ -165,7 +165,7 @@ def evaluate(predictor, *, slices_dir, start_t=None, max_samples=None, seed=42):
     return {
         "dataset": manifest["dataset"], "start_t": start_t,
         "sample_scope": "shared_community_eval_non_empty_only",
-        "fit_end_t": predictor.scorer.config.fit_end_t, "threshold": predictor.threshold,
+        "threshold": predictor.threshold,
         "candidate_history": "union_of_q_historical_k_core_communities_through_t",
         "edge_candidates": "historical_undirected_edges_within_candidate_through_t",
         "samples": len(samples), "per_k": per_k,
@@ -220,7 +220,6 @@ def main(argv=None):
             raise ValueError("EAGLE checkpoint lacks verified 7:3 snapshot training split")
         result = evaluate(predictor, slices_dir=args.slices_dir, start_t=args.start_t,
                           max_samples=args.max_samples)
-        result["training_split"] = baseline_training_split(len(snapshots))
     text = json.dumps(result, indent=2)
     if args.command == "eval" and args.output:
         with args.output.open("x", encoding="utf-8") as handle:

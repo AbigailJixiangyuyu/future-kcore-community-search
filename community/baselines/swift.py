@@ -4,9 +4,9 @@ import argparse
 import json
 
 from datasets.community_eval_builder import set_metrics
-from datasets.baseline_eval import (baseline_training_split, evaluation_start_t,
-                                    load_test_samples, non_empty_samples,
-                                    require_fit_boundary, query_set_sha256)
+from datasets.baseline_eval import (evaluation_start_t, load_test_samples,
+                                    non_empty_samples, require_fit_boundary,
+                                    query_set_sha256)
 from datasets.dataset_builder import build_snapshots
 from methods.swift_snapshot import load_predictor
 from community.baselines.baseline_graph import component_from_adjacency
@@ -110,7 +110,6 @@ def main():
             results.append(set_metrics(prediction, sample["community"]))
         print(json.dumps({"count": len(results), "candidate_protocol": method.protocol,
                           "start_t": start_t,
-                          "training_split": baseline_training_split(len(snaps)),
                           "sample_scope": "shared_community_eval_non_empty_only",
                           "query_set_sha256": query_set_sha256(samples),
                           "threshold": method.threshold,

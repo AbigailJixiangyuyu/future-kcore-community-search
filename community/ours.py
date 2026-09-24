@@ -967,7 +967,6 @@ def _evaluate(args, *, predictor_builder=None, metadata=None):
             _resolve_checkpoint_path(args.slices_dir, args.checkpoint).resolve()
         ),
         "start_t": start_t,
-        "training_split": training_split,
         "samples": len(samples),
         "sample_scope": "shared_community_eval_non_empty_only",
         "query_set_sha256": query_set_sha256(samples),
